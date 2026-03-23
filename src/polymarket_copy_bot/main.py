@@ -12,6 +12,7 @@ import structlog
 from polymarket_copy_bot.client import PolymarketClient
 from polymarket_copy_bot.config import BotConfig
 from polymarket_copy_bot.copier import TradeCopier
+from polymarket_copy_bot.dashboard import start_dashboard
 from polymarket_copy_bot.state import update_last_running_ts
 from polymarket_copy_bot.tracker import TradeTracker
 
@@ -70,6 +71,9 @@ def main() -> None:
 
     # Reconcile positions: close profitable trades the tracked trader exited while we were offline.
     copier.reconcile_on_startup()
+
+    # Start web dashboard.
+    start_dashboard(copier, client, port=config.dashboard_port)
 
     # --- Main loop ---
     low_balance_logged = False

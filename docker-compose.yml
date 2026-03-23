@@ -3,5 +3,7 @@ services:
     build: .
     env_file: .env
     restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PORT:-8080}:${DASHBOARD_PORT:-8080}"
     volumes:
       - ./bot_state.json:/app/bot_state.json

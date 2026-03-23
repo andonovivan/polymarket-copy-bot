@@ -56,6 +56,9 @@ class BotConfig(BaseModel):
         description="When True, logs all decisions but never places real orders.",
     )
 
+    # --- Dashboard ---
+    dashboard_port: int = Field(default=8080, description="Port for the web dashboard.")
+
     # --- Logging ---
     log_level: str = Field(default="INFO")
 
@@ -84,5 +87,6 @@ class BotConfig(BaseModel):
             copy_sells=os.getenv("COPY_SELLS", "true").lower() == "true",
             poll_interval_seconds=int(os.getenv("POLL_INTERVAL_SECONDS", "30")),
             dry_run=os.getenv("DRY_RUN", "true").lower() == "true",
+            dashboard_port=int(os.getenv("DASHBOARD_PORT", "8080")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
         )
