@@ -66,6 +66,7 @@ def _build_dashboard_data(copier: TradeCopier, client: PolymarketClient) -> dict
             "cost": round(cost, 4),
             "current_value": round(current_value, 4) if current_value else None,
             "unrealized_pnl": round(unrealized, 4) if unrealized is not None else None,
+            "opened_at": copier._opened_at.get(asset_id, 0),
         })
 
         if unrealized is not None:
@@ -75,6 +76,16 @@ def _build_dashboard_data(copier: TradeCopier, client: PolymarketClient) -> dict
     pnl = copier._pnl
     total_trades = pnl["total_trades"]
     win_rate = pnl["winning_trades"] / total_trades * 100 if total_trades > 0 else 0
+
+    # Sort positions by opened_at descending (newest first).
+    positions.sort(key=lambda p: p.get("opened_at", 0), reverse=True)
+
+    # Sort closed trades by closed_at descending (newest first).
+    sorted_history = sorted(
+        pnl["trade_history"],
+        key=lambda t: t.get("closed_at", t.get("ts", 0)),
+        reverse=True,
+    )
 
     return {
         "positions": positions,
@@ -88,9 +99,10 @@ def _build_dashboard_data(copier: TradeCopier, client: PolymarketClient) -> dict
             "win_rate": round(win_rate, 1),
         },
         "combined_pnl": round(pnl["total_realized"] + total_unrealized, 4),
-        "recent_trades": pnl["trade_history"][-20:][::-1],  # last 20, newest first
+        "recent_trades": sorted_history,
         "dry_run": copier.config.dry_run,
         "tracked_wallets": len(copier.config.tracked_wallets),
+        "tracked_wallets_list": list(copier.config.tracked_wallets),
         "ts": int(time.time()),
     }
 
@@ -124,6 +136,12 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   tr:hover { background: #161b22; }
   .section-title { color: #58a6ff; font-size: 1em; margin: 20px 0 10px; }
   .asset-id { font-family: monospace; font-size: 0.8em; color: #8b949e; }
+  .pagination { display: flex; align-items: center; gap: 8px; margin: 8px 0 20px; }
+  .pagination button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+    border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 0.8em; }
+  .pagination button:hover { background: #30363d; }
+  .pagination button:disabled { opacity: 0.4; cursor: default; }
+  .pagination .page-info { color: #8b949e; font-size: 0.8em; }
   .footer { color: #484f58; font-size: 0.75em; margin-top: 24px; }
   @media (max-width: 600px) {
     .cards { grid-template-columns: 1fr 1fr; }
@@ -165,22 +183,28 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <h2 class="section-title">Open Positions</h2>
 <table>
   <thead>
-    <tr><th>Asset</th><th>Shares</th><th>Buy Price</th><th>Current</th><th>Cost</th><th>Value</th><th>P&amp;L</th></tr>
+    <tr><th>Asset</th><th>Shares</th><th>Buy Price</th><th>Current</th><th>Cost</th><th>Value</th><th>P&amp;L</th><th>Opened</th></tr>
   </thead>
-  <tbody id="positions-body"><tr><td colspan="7">Loading...</td></tr></tbody>
+  <tbody id="positions-body"><tr><td colspan="8">Loading...</td></tr></tbody>
 </table>
+<div class="pagination" id="positions-pagination"></div>
 
 <h2 class="section-title">Recent Closed Trades</h2>
 <table>
   <thead>
-    <tr><th>Asset</th><th>Buy</th><th>Sell</th><th>Shares</th><th>P&amp;L</th><th>Time</th></tr>
+    <tr><th>Asset</th><th>Buy</th><th>Sell</th><th>Shares</th><th>P&amp;L</th><th>Opened</th><th>Closed</th></tr>
   </thead>
-  <tbody id="history-body"><tr><td colspan="6">Loading...</td></tr></tbody>
+  <tbody id="history-body"><tr><td colspan="7">Loading...</td></tr></tbody>
 </table>
+<div class="pagination" id="history-pagination"></div>
 
 <div class="footer">Auto-refreshes every 10s</div>
 
 <script>
+const PAGE_SIZE = 10;
+let posPage = 0, histPage = 0;
+let lastData = null;
+
 function pnlClass(v) { return v > 0 ? 'positive' : v < 0 ? 'negative' : 'neutral'; }
 function fmt(v, prefix) {
   if (v === null || v === undefined) return '-';
@@ -189,18 +213,90 @@ function fmt(v, prefix) {
 }
 function fmtUsd(v) { return fmt(v, '$'); }
 function shortId(id) { return id ? id.slice(0, 8) + '...' + id.slice(-6) : '-'; }
-function timeAgo(ts) {
-  const diff = Math.floor(Date.now()/1000) - ts;
-  if (diff < 60) return diff + 's ago';
-  if (diff < 3600) return Math.floor(diff/60) + 'm ago';
-  if (diff < 86400) return Math.floor(diff/3600) + 'h ago';
-  return Math.floor(diff/86400) + 'd ago';
+function fmtDate(ts) {
+  if (!ts) return '-';
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString(undefined, {month:'short', day:'numeric'}) + ' ' + d.toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit'});
+}
+
+function paginate(items, page) {
+  const start = page * PAGE_SIZE;
+  return items.slice(start, start + PAGE_SIZE);
+}
+
+function renderPagination(containerId, total, currentPage, onPageChange) {
+  const el = document.getElementById(containerId);
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  if (total <= PAGE_SIZE) { el.innerHTML = ''; return; }
+  el.innerHTML =
+    '<button ' + (currentPage <= 0 ? 'disabled' : '') + ' onclick="' + onPageChange + '(-1)">&#8592; Prev</button>' +
+    '<span class="page-info">' + (currentPage + 1) + ' / ' + totalPages + ' (' + total + ' rows)</span>' +
+    '<button ' + (currentPage >= totalPages - 1 ? 'disabled' : '') + ' onclick="' + onPageChange + '(1)">Next &#8594;</button>';
+}
+
+function changePosPage(delta) {
+  if (!lastData) return;
+  const maxPage = Math.max(0, Math.ceil(lastData.positions.length / PAGE_SIZE) - 1);
+  posPage = Math.max(0, Math.min(maxPage, posPage + delta));
+  renderPositions(lastData);
+}
+
+function changeHistPage(delta) {
+  if (!lastData) return;
+  const maxPage = Math.max(0, Math.ceil(lastData.recent_trades.length / PAGE_SIZE) - 1);
+  histPage = Math.max(0, Math.min(maxPage, histPage + delta));
+  renderHistory(lastData);
+}
+
+function renderPositions(d) {
+  const pb = document.getElementById('positions-body');
+  if (d.positions.length === 0) {
+    pb.innerHTML = '<tr><td colspan="8" style="color:#8b949e">No open positions</td></tr>';
+  } else {
+    const page = paginate(d.positions, posPage);
+    pb.innerHTML = page.map(p => {
+      const pnl = p.unrealized_pnl;
+      return '<tr>' +
+        '<td class="asset-id">' + shortId(p.asset_id) + '</td>' +
+        '<td>' + p.shares + '</td>' +
+        '<td>$' + p.buy_price + '</td>' +
+        '<td>' + (p.current_price !== null ? '$' + p.current_price : '-') + '</td>' +
+        '<td>$' + p.cost + '</td>' +
+        '<td>' + (p.current_value !== null ? '$' + p.current_value : '-') + '</td>' +
+        '<td class="' + pnlClass(pnl) + '">' + (pnl !== null ? fmtUsd(pnl) : '-') + '</td>' +
+        '<td>' + fmtDate(p.opened_at) + '</td>' +
+      '</tr>';
+    }).join('');
+  }
+  renderPagination('positions-pagination', d.positions.length, posPage, 'changePosPage');
+}
+
+function renderHistory(d) {
+  const hb = document.getElementById('history-body');
+  if (d.recent_trades.length === 0) {
+    hb.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No closed trades yet</td></tr>';
+  } else {
+    const page = paginate(d.recent_trades, histPage);
+    hb.innerHTML = page.map(t => {
+      return '<tr>' +
+        '<td class="asset-id">' + shortId(t.asset_id) + '</td>' +
+        '<td>$' + t.buy_price + '</td>' +
+        '<td>$' + t.sell_price + '</td>' +
+        '<td>' + t.shares + '</td>' +
+        '<td class="' + pnlClass(t.pnl) + '">' + fmtUsd(t.pnl) + '</td>' +
+        '<td>' + fmtDate(t.opened_at) + '</td>' +
+        '<td>' + fmtDate(t.closed_at) + '</td>' +
+      '</tr>';
+    }).join('');
+  }
+  renderPagination('history-pagination', d.recent_trades.length, histPage, 'changeHistPage');
 }
 
 async function refresh() {
   try {
     const r = await fetch('/api/data');
     const d = await r.json();
+    lastData = d;
 
     document.getElementById('badge').innerHTML = d.dry_run ? '<span class="dry-run-badge">DRY RUN</span>' : '';
     document.getElementById('wallets').textContent = d.tracked_wallets;
@@ -222,41 +318,14 @@ async function refresh() {
     document.getElementById('positions-count').textContent = d.positions.length;
     document.getElementById('invested').textContent = '$' + d.total_cost.toFixed(2);
 
-    // Positions table
-    const pb = document.getElementById('positions-body');
-    if (d.positions.length === 0) {
-      pb.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No open positions</td></tr>';
-    } else {
-      pb.innerHTML = d.positions.map(p => {
-        const pnl = p.unrealized_pnl;
-        return '<tr>' +
-          '<td class="asset-id">' + shortId(p.asset_id) + '</td>' +
-          '<td>' + p.shares + '</td>' +
-          '<td>$' + p.buy_price + '</td>' +
-          '<td>' + (p.current_price !== null ? '$' + p.current_price : '-') + '</td>' +
-          '<td>$' + p.cost + '</td>' +
-          '<td>' + (p.current_value !== null ? '$' + p.current_value : '-') + '</td>' +
-          '<td class="' + pnlClass(pnl) + '">' + (pnl !== null ? fmtUsd(pnl) : '-') + '</td>' +
-        '</tr>';
-      }).join('');
-    }
+    // Clamp pages if data shrunk
+    const maxPosPage = Math.max(0, Math.ceil(d.positions.length / PAGE_SIZE) - 1);
+    if (posPage > maxPosPage) posPage = maxPosPage;
+    const maxHistPage = Math.max(0, Math.ceil(d.recent_trades.length / PAGE_SIZE) - 1);
+    if (histPage > maxHistPage) histPage = maxHistPage;
 
-    // History table
-    const hb = document.getElementById('history-body');
-    if (d.recent_trades.length === 0) {
-      hb.innerHTML = '<tr><td colspan="6" style="color:#8b949e">No closed trades yet</td></tr>';
-    } else {
-      hb.innerHTML = d.recent_trades.map(t => {
-        return '<tr>' +
-          '<td class="asset-id">' + shortId(t.asset_id) + '</td>' +
-          '<td>$' + t.buy_price + '</td>' +
-          '<td>$' + t.sell_price + '</td>' +
-          '<td>' + t.shares + '</td>' +
-          '<td class="' + pnlClass(t.pnl) + '">' + fmtUsd(t.pnl) + '</td>' +
-          '<td>' + timeAgo(t.ts) + '</td>' +
-        '</tr>';
-      }).join('');
-    }
+    renderPositions(d);
+    renderHistory(d);
   } catch(e) { console.error('Dashboard refresh failed', e); }
 }
 

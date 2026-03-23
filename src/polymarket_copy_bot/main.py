@@ -13,7 +13,7 @@ from polymarket_copy_bot.client import PolymarketClient
 from polymarket_copy_bot.config import BotConfig
 from polymarket_copy_bot.copier import TradeCopier
 from polymarket_copy_bot.dashboard import start_dashboard
-from polymarket_copy_bot.state import update_last_running_ts
+from polymarket_copy_bot.state import init_db, update_last_running_ts
 from polymarket_copy_bot.tracker import TradeTracker
 
 logger = structlog.get_logger()
@@ -60,6 +60,9 @@ def main() -> None:
 
     if config.dry_run:
         logger.warning("DRY_RUN_MODE — no real orders will be placed")
+
+    # --- Initialise database (migrates from JSON if needed) ---
+    init_db()
 
     # --- Initialise components ---
     client = PolymarketClient(config)

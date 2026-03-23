@@ -25,6 +25,7 @@ class TradeCopier:
         self._exposure: dict[str, float] = state["exposure"]
         self._shares_held: dict[str, float] = state["shares_held"]
         self._buy_prices: dict[str, float] = state["buy_prices"]
+        self._opened_at: dict[str, int] = state.get("opened_at", {})
         self._last_running_ts: int = state["last_running_ts"]
         self._pnl: dict = state["pnl"]
         if self._shares_held:
@@ -47,10 +48,12 @@ class TradeCopier:
             self.config.tracked_wallets,
             self._buy_prices,
             self._pnl,
+            self._opened_at,
         )
 
     def _record_pnl(self, asset_id: str, buy_price: float, sell_price: float, shares: float) -> None:
         """Record a realized trade P&L."""
+        now = int(time.time())
         pnl = round((sell_price - buy_price) * shares, 4)
         self._pnl["total_realized"] = round(self._pnl["total_realized"] + pnl, 4)
         self._pnl["total_trades"] += 1
@@ -59,17 +62,18 @@ class TradeCopier:
         else:
             self._pnl["losing_trades"] += 1
 
-        # Keep last 500 trades in history.
+        opened_ts = self._opened_at.get(asset_id, 0)
+
         self._pnl["trade_history"].append({
             "asset_id": asset_id,
             "buy_price": buy_price,
             "sell_price": sell_price,
             "shares": shares,
             "pnl": pnl,
-            "ts": int(time.time()),
+            "ts": now,
+            "opened_at": opened_ts,
+            "closed_at": now,
         })
-        if len(self._pnl["trade_history"]) > 500:
-            self._pnl["trade_history"] = self._pnl["trade_history"][-500:]
 
         total_trades = self._pnl["total_trades"]
         win_rate = self._pnl["winning_trades"] / total_trades * 100 if total_trades > 0 else 0
@@ -172,6 +176,7 @@ class TradeCopier:
                 self._exposure[asset_id] = 0.0
                 self._shares_held[asset_id] = 0.0
                 self._buy_prices.pop(asset_id, None)
+                self._opened_at.pop(asset_id, None)
                 self._save()
                 logger.info("reconcile_sold", asset_id=asset_id[:16] + "...", shares=shares, price=midpoint)
 
@@ -251,6 +256,9 @@ class TradeCopier:
                 old_shares = self._shares_held.get(trade.asset_id, 0.0)
                 new_shares = old_shares + fixed_size
                 self._shares_held[trade.asset_id] = new_shares
+                # Only set opened_at on the first buy for this asset.
+                if trade.asset_id not in self._opened_at or old_shares <= 0:
+                    self._opened_at[trade.asset_id] = int(time.time())
                 # Weighted average buy price across multiple buys.
                 old_price = self._buy_prices.get(trade.asset_id, 0.0)
                 if new_shares > 0:
@@ -266,6 +274,7 @@ class TradeCopier:
                 self._exposure[trade.asset_id] = max(0.0, current_exposure - sell_value)
                 self._shares_held[trade.asset_id] = 0.0
                 self._buy_prices.pop(trade.asset_id, None)
+                self._opened_at.pop(trade.asset_id, None)
 
             self._save()
             logger.info(

@@ -6,4 +6,4 @@ services:
     ports:
       - "${DASHBOARD_PORT:-8080}:${DASHBOARD_PORT:-8080}"
     volumes:
-      - ./bot_state.json:/app/bot_state.json
+      - ./bot_state.db:/app/bot_state.db
