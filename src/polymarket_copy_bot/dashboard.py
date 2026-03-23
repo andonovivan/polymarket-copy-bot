@@ -2,6 +2,39 @@
 
 Runs a tiny HTTP server in a background thread. The single page auto-refreshes
 every 10 seconds and shows open positions with live unrealized P&L.
+
+Dashboard API Endpoints
+-----------------------
+GET  /              → Serves the HTML dashboard page.
+GET  /api/data      → Returns full dashboard JSON (positions, P&L, wallets, history).
+POST /api/wallets   → Add a tracked wallet.    Body: {"wallet": "0x..."}
+                      Returns {"ok": true} or {"error": "..."}
+DELETE /api/wallets  → Remove a tracked wallet. Body: {"wallet": "0x..."}
+                      Returns {"ok": true} or {"error": "..."}
+POST /api/close     → Manually close an open position at current midpoint.
+                      Body: {"asset_id": "<token_id>"}
+                      Returns {"ok": true, "shares": N, "price": N, "pnl": N} or {"error": "..."}
+
+External APIs used (Polymarket)
+-------------------------------
+- CLOB API (https://docs.polymarket.com/#clob-api):
+  - GET  /midpoint?token_id=X       → Get midpoint price for a token.
+  - GET  /balance-allowance          → Get USDC balance (AssetType.COLLATERAL).
+  - POST /order                      → Place a signed limit order.
+  - GET  /markets/{condition_id}     → Get market info.
+  - GET  /order-book?token_id=X      → Get order book.
+
+- Data API (https://docs.polymarket.com/#data-api):
+  - GET  https://data-api.polymarket.com/trades?user=X&limit=N → Get trades for a wallet.
+    Response fields: transactionHash, asset (token_id), side (BUY/SELL),
+    price, size, timestamp (unix int).
+
+- py-clob-client (Python SDK):
+  - ClobClient(host, chain_id, key, creds=ApiCreds(...))
+  - client.get_midpoint(token_id) → {"mid": "0.725"}
+  - client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+  - client.create_order(OrderArgs(...)) → signed order
+  - client.post_order(signed_order) → result dict
 """
 
 from __future__ import annotations
@@ -78,16 +111,6 @@ def _build_dashboard_data(copier: TradeCopier, client: PolymarketClient) -> dict
     total_trades = pnl["total_trades"]
     win_rate = pnl["winning_trades"] / total_trades * 100 if total_trades > 0 else 0
 
-    # Sort positions by opened_at descending (newest first).
-    positions.sort(key=lambda p: p.get("opened_at", 0), reverse=True)
-
-    # Sort closed trades by closed_at descending (newest first).
-    sorted_history = sorted(
-        pnl["trade_history"],
-        key=lambda t: t.get("closed_at", t.get("ts", 0)),
-        reverse=True,
-    )
-
     return {
         "positions": positions,
         "total_unrealized": round(total_unrealized, 4),
@@ -100,7 +123,7 @@ def _build_dashboard_data(copier: TradeCopier, client: PolymarketClient) -> dict
             "win_rate": round(win_rate, 1),
         },
         "combined_pnl": round(pnl["total_realized"] + total_unrealized, 4),
-        "recent_trades": sorted_history,
+        "recent_trades": pnl["trade_history"],
         "dry_run": copier.config.dry_run,
         "tracked_wallets": len(copier.config.tracked_wallets),
         "tracked_wallets_list": list(copier.config.tracked_wallets),
@@ -132,7 +155,10 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .neutral { color: #c9d1d9; }
   table { width: 100%; border-collapse: collapse; margin-bottom: 24px; }
   th { text-align: left; color: #8b949e; font-size: 0.75em; text-transform: uppercase;
-       letter-spacing: 0.05em; padding: 8px 12px; border-bottom: 1px solid #30363d; }
+       letter-spacing: 0.05em; padding: 8px 12px; border-bottom: 1px solid #30363d;
+       cursor: pointer; user-select: none; white-space: nowrap; }
+  th:hover { color: #c9d1d9; }
+  th .sort-arrow { margin-left: 4px; font-size: 0.7em; }
   td { padding: 8px 12px; border-bottom: 1px solid #21262d; font-size: 0.9em; }
   tr:hover { background: #161b22; }
   .section-title { color: #58a6ff; font-size: 1em; margin: 20px 0 10px; }
@@ -169,6 +195,10 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .wallet-item button:hover { background: #f85149; }
   .wallet-msg { font-size: 0.8em; margin-top: 8px; min-height: 1.2em; }
   .wallet-count { color: #8b949e; font-size: 0.85em; margin-bottom: 12px; }
+  .btn-close-pos { background: #da3633; color: #fff; border: none; border-radius: 4px;
+    padding: 3px 10px; cursor: pointer; font-size: 0.75em; white-space: nowrap; }
+  .btn-close-pos:hover { background: #f85149; }
+  .btn-close-pos:disabled { opacity: 0.4; cursor: default; }
   .footer { color: #484f58; font-size: 0.75em; margin-top: 24px; }
   @media (max-width: 600px) {
     .cards { grid-template-columns: 1fr 1fr; }
@@ -216,16 +246,34 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   <h2 class="section-title">Open Positions</h2>
   <table>
     <thead>
-      <tr><th>Asset</th><th>Shares</th><th>Buy Price</th><th>Current</th><th>Cost</th><th>Value</th><th>P&amp;L</th><th>Opened</th></tr>
+      <tr>
+        <th onclick="sortPos('asset_id')">Asset <span id="pos-sort-asset_id" class="sort-arrow"></span></th>
+        <th onclick="sortPos('shares')">Shares <span id="pos-sort-shares" class="sort-arrow"></span></th>
+        <th onclick="sortPos('buy_price')">Buy Price <span id="pos-sort-buy_price" class="sort-arrow"></span></th>
+        <th onclick="sortPos('current_price')">Current <span id="pos-sort-current_price" class="sort-arrow"></span></th>
+        <th onclick="sortPos('cost')">Cost <span id="pos-sort-cost" class="sort-arrow"></span></th>
+        <th onclick="sortPos('current_value')">Value <span id="pos-sort-current_value" class="sort-arrow"></span></th>
+        <th onclick="sortPos('unrealized_pnl')">P&amp;L <span id="pos-sort-unrealized_pnl" class="sort-arrow"></span></th>
+        <th onclick="sortPos('opened_at')">Opened <span id="pos-sort-opened_at" class="sort-arrow"></span></th>
+        <th></th>
+      </tr>
     </thead>
-    <tbody id="positions-body"><tr><td colspan="8">Loading...</td></tr></tbody>
+    <tbody id="positions-body"><tr><td colspan="9">Loading...</td></tr></tbody>
   </table>
   <div class="pagination" id="positions-pagination"></div>
 
   <h2 class="section-title">Recent Closed Trades</h2>
   <table>
     <thead>
-      <tr><th>Asset</th><th>Buy</th><th>Sell</th><th>Shares</th><th>P&amp;L</th><th>Opened</th><th>Closed</th></tr>
+      <tr>
+        <th onclick="sortHist('asset_id')">Asset <span id="hist-sort-asset_id" class="sort-arrow"></span></th>
+        <th onclick="sortHist('buy_price')">Buy <span id="hist-sort-buy_price" class="sort-arrow"></span></th>
+        <th onclick="sortHist('sell_price')">Sell <span id="hist-sort-sell_price" class="sort-arrow"></span></th>
+        <th onclick="sortHist('shares')">Shares <span id="hist-sort-shares" class="sort-arrow"></span></th>
+        <th onclick="sortHist('pnl')">P&amp;L <span id="hist-sort-pnl" class="sort-arrow"></span></th>
+        <th onclick="sortHist('opened_at')">Opened <span id="hist-sort-opened_at" class="sort-arrow"></span></th>
+        <th onclick="sortHist('closed_at')">Closed <span id="hist-sort-closed_at" class="sort-arrow"></span></th>
+      </tr>
     </thead>
     <tbody id="history-body"><tr><td colspan="7">Loading...</td></tr></tbody>
   </table>
@@ -257,6 +305,41 @@ function switchTab(name) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
   document.querySelector('.tab-btn[onclick*="' + name + '"]').classList.add('active');
+}
+
+// --- Sorting state ---
+let posSortKey = 'opened_at', posSortAsc = false;
+let histSortKey = 'closed_at', histSortAsc = false;
+
+function sortData(items, key, asc) {
+  return [...items].sort((a, b) => {
+    let va = a[key], vb = b[key];
+    if (va === null || va === undefined) va = -Infinity;
+    if (vb === null || vb === undefined) vb = -Infinity;
+    if (typeof va === 'string') return asc ? va.localeCompare(vb) : vb.localeCompare(va);
+    return asc ? va - vb : vb - va;
+  });
+}
+
+function updateSortArrows(prefix, keys, activeKey, asc) {
+  keys.forEach(k => {
+    const el = document.getElementById(prefix + k);
+    if (el) el.textContent = k === activeKey ? (asc ? String.fromCharCode(9650) : String.fromCharCode(9660)) : '';
+  });
+}
+
+function sortPos(key) {
+  if (posSortKey === key) { posSortAsc = !posSortAsc; }
+  else { posSortKey = key; posSortAsc = true; }
+  posPage = 0;
+  renderPositions(lastData);
+}
+
+function sortHist(key) {
+  if (histSortKey === key) { histSortAsc = !histSortAsc; }
+  else { histSortKey = key; histSortAsc = true; }
+  histPage = 0;
+  renderHistory(lastData);
 }
 
 function pnlClass(v) { return v > 0 ? 'positive' : v < 0 ? 'negative' : 'neutral'; }
@@ -304,10 +387,13 @@ function changeHistPage(delta) {
 
 function renderPositions(d) {
   const pb = document.getElementById('positions-body');
+  const posKeys = ['asset_id','shares','buy_price','current_price','cost','current_value','unrealized_pnl','opened_at'];
+  updateSortArrows('pos-sort-', posKeys, posSortKey, posSortAsc);
   if (d.positions.length === 0) {
-    pb.innerHTML = '<tr><td colspan="8" style="color:#8b949e">No open positions</td></tr>';
+    pb.innerHTML = '<tr><td colspan="9" style="color:#8b949e">No open positions</td></tr>';
   } else {
-    const page = paginate(d.positions, posPage);
+    const sorted = sortData(d.positions, posSortKey, posSortAsc);
+    const page = paginate(sorted, posPage);
     pb.innerHTML = page.map(p => {
       const pnl = p.unrealized_pnl;
       return '<tr>' +
@@ -319,6 +405,7 @@ function renderPositions(d) {
         '<td>' + (p.current_value !== null ? '$' + p.current_value : '-') + '</td>' +
         '<td class="' + pnlClass(pnl) + '">' + (pnl !== null ? fmtUsd(pnl) : '-') + '</td>' +
         '<td>' + fmtDate(p.opened_at) + '</td>' +
+        '<td><button class="btn-close-pos" data-asset="' + p.asset_id + '" onclick="closePosition(this)">Close</button></td>' +
       '</tr>';
     }).join('');
   }
@@ -327,10 +414,13 @@ function renderPositions(d) {
 
 function renderHistory(d) {
   const hb = document.getElementById('history-body');
+  const histKeys = ['asset_id','buy_price','sell_price','shares','pnl','opened_at','closed_at'];
+  updateSortArrows('hist-sort-', histKeys, histSortKey, histSortAsc);
   if (d.recent_trades.length === 0) {
     hb.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No closed trades yet</td></tr>';
   } else {
-    const page = paginate(d.recent_trades, histPage);
+    const sorted = sortData(d.recent_trades, histSortKey, histSortAsc);
+    const page = paginate(sorted, histPage);
     hb.innerHTML = page.map(t => {
       return '<tr>' +
         '<td class="asset-id">' + shortId(t.asset_id) + '</td>' +
@@ -437,6 +527,21 @@ async function addWallet() {
   } catch(e) { showWalletMsg('Failed to add wallet', true); }
 }
 
+async function closePosition(btn) {
+  const assetId = btn.dataset.asset;
+  const short = assetId.slice(0,8) + '...' + assetId.slice(-6);
+  if (!confirm('Close position ' + short + ' at current market price?')) return;
+  btn.disabled = true;
+  btn.textContent = 'Closing...';
+  try {
+    const r = await fetch('/api/close', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({asset_id:assetId})});
+    const d = await r.json();
+    if (d.error) { alert('Failed: ' + d.error); btn.disabled = false; btn.textContent = 'Close'; return; }
+    alert('Position closed at $' + d.price + ' | P&L: ' + (d.pnl >= 0 ? '+' : '') + '$' + d.pnl.toFixed(4));
+    refresh();
+  } catch(e) { alert('Failed to close position'); btn.disabled = false; btn.textContent = 'Close'; }
+}
+
 async function removeWallet(addr) {
   if (!confirm('Remove wallet ' + addr.slice(0,10) + '... from tracking?')) return;
   try {
@@ -523,6 +628,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             data = self._read_body()
             wallet = data.get("wallet", "")
             result = _add_wallet(self.copier, self.tracker, wallet)
+            self._send_json(result, 200 if "ok" in result else 400)
+        elif self.path == "/api/close":
+            data = self._read_body()
+            asset_id = data.get("asset_id", "")
+            if not asset_id:
+                self._send_json({"error": "Missing asset_id"}, 400)
+                return
+            result = self.copier.close_position(asset_id)
             self._send_json(result, 200 if "ok" in result else 400)
         else:
             self.send_response(404)

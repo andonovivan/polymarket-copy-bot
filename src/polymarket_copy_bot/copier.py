@@ -182,6 +182,49 @@ class TradeCopier:
 
         logger.info("reconcile_done")
 
+    def close_position(self, asset_id: str) -> dict:
+        """
+        Manually close a position by selling all held shares at the current midpoint.
+        Returns a result dict with status info.
+        """
+        shares = self._shares_held.get(asset_id, 0.0)
+        if shares <= 0:
+            return {"error": "No position held for this asset"}
+
+        midpoint = self.client.get_midpoint(asset_id)
+        if midpoint is None or midpoint <= 0:
+            return {"error": "Could not get current price for this asset"}
+
+        result = self.client.place_order(
+            token_id=asset_id,
+            side="SELL",
+            price=midpoint,
+            size=shares,
+        )
+
+        if result is None:
+            return {"error": "Order placement failed"}
+
+        buy_price = self._buy_prices.get(asset_id, 0.0)
+        pnl = round((midpoint - buy_price) * shares, 4)
+        self._record_pnl(asset_id, buy_price, midpoint, shares)
+        current_exposure = self._exposure.get(asset_id, 0.0)
+        sell_value = shares * midpoint
+        self._exposure[asset_id] = max(0.0, current_exposure - sell_value)
+        self._shares_held[asset_id] = 0.0
+        self._buy_prices.pop(asset_id, None)
+        self._opened_at.pop(asset_id, None)
+        self._save()
+
+        logger.info(
+            "position_manually_closed",
+            asset_id=asset_id[:16] + "...",
+            shares=shares,
+            price=midpoint,
+            pnl=pnl,
+        )
+        return {"ok": True, "shares": shares, "price": midpoint, "pnl": pnl}
+
     def copy(self, trade: DetectedTrade) -> bool:
         """
         Attempt to replicate *trade*. Returns True if an order was placed.
