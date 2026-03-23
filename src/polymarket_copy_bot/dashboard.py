@@ -143,25 +143,32 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .pagination button:hover { background: #30363d; }
   .pagination button:disabled { opacity: 0.4; cursor: default; }
   .pagination .page-info { color: #8b949e; font-size: 0.8em; }
-  .wallets-section { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-    padding: 16px; margin-bottom: 24px; }
-  .wallets-section h2 { font-size: 1em; color: #58a6ff; margin-bottom: 12px; }
-  .wallet-add { display: flex; gap: 8px; margin-bottom: 12px; }
+  .tabs { display: flex; gap: 0; margin-bottom: 20px; border-bottom: 1px solid #30363d; }
+  .tab-btn { background: none; border: none; color: #8b949e; padding: 10px 20px;
+    cursor: pointer; font-size: 0.9em; border-bottom: 2px solid transparent; }
+  .tab-btn:hover { color: #c9d1d9; }
+  .tab-btn.active { color: #58a6ff; border-bottom-color: #58a6ff; }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+  .wallets-section { margin-bottom: 24px; }
+  .wallet-add { display: flex; gap: 8px; margin-bottom: 16px; }
   .wallet-add input { flex: 1; background: #0d1117; border: 1px solid #30363d; border-radius: 4px;
-    color: #c9d1d9; padding: 6px 10px; font-family: monospace; font-size: 0.85em; }
+    color: #c9d1d9; padding: 8px 12px; font-family: monospace; font-size: 0.85em; }
   .wallet-add input::placeholder { color: #484f58; }
   .wallet-add button { background: #238636; color: #fff; border: none; border-radius: 4px;
-    padding: 6px 14px; cursor: pointer; font-size: 0.85em; white-space: nowrap; }
+    padding: 8px 16px; cursor: pointer; font-size: 0.85em; white-space: nowrap; }
   .wallet-add button:hover { background: #2ea043; }
   .wallet-list { list-style: none; }
   .wallet-item { display: flex; justify-content: space-between; align-items: center;
-    padding: 6px 0; border-bottom: 1px solid #21262d; font-family: monospace; font-size: 0.85em; }
-  .wallet-item:last-child { border-bottom: none; }
-  .wallet-item .addr { color: #8b949e; overflow: hidden; text-overflow: ellipsis; }
+    background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    padding: 10px 14px; margin-bottom: 8px; font-family: monospace; font-size: 0.85em; }
+  .wallet-item .addr { color: #c9d1d9; overflow: hidden; text-overflow: ellipsis; }
+  .wallet-item .wallet-idx { color: #484f58; margin-right: 10px; font-size: 0.8em; min-width: 24px; }
   .wallet-item button { background: #da3633; color: #fff; border: none; border-radius: 4px;
-    padding: 3px 10px; cursor: pointer; font-size: 0.75em; }
+    padding: 4px 12px; cursor: pointer; font-size: 0.75em; flex-shrink: 0; margin-left: 10px; }
   .wallet-item button:hover { background: #f85149; }
-  .wallet-msg { font-size: 0.8em; margin-top: 6px; min-height: 1.2em; }
+  .wallet-msg { font-size: 0.8em; margin-top: 8px; min-height: 1.2em; }
+  .wallet-count { color: #8b949e; font-size: 0.85em; margin-bottom: 12px; }
   .footer { color: #484f58; font-size: 0.75em; margin-top: 24px; }
   @media (max-width: 600px) {
     .cards { grid-template-columns: 1fr 1fr; }
@@ -173,67 +180,84 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <h1>Polymarket Copy Bot <span id="badge"></span></h1>
 <p class="subtitle">Tracking <span id="wallets">-</span> wallets &middot; Updated <span id="updated">-</span></p>
 
-<div class="cards">
-  <div class="card">
-    <div class="card-label">Combined P&amp;L</div>
-    <div class="card-value" id="combined">-</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Unrealized P&amp;L</div>
-    <div class="card-value" id="unrealized">-</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Realized P&amp;L</div>
-    <div class="card-value" id="realized">-</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Win Rate</div>
-    <div class="card-value" id="winrate">-</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Open Positions</div>
-    <div class="card-value neutral" id="positions-count">-</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Total Invested</div>
-    <div class="card-value neutral" id="invested">-</div>
-  </div>
+<div class="tabs">
+  <button class="tab-btn active" onclick="switchTab('dashboard')">Dashboard</button>
+  <button class="tab-btn" onclick="switchTab('wallets')">Wallets</button>
 </div>
 
-<div class="wallets-section">
-  <h2>Tracked Wallets</h2>
-  <div class="wallet-add">
-    <input type="text" id="wallet-input" placeholder="0x... wallet address" />
-    <button onclick="addWallet()">Add Wallet</button>
+<div id="tab-dashboard" class="tab-pane active">
+  <div class="cards">
+    <div class="card">
+      <div class="card-label">Combined P&amp;L</div>
+      <div class="card-value" id="combined">-</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Unrealized P&amp;L</div>
+      <div class="card-value" id="unrealized">-</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Realized P&amp;L</div>
+      <div class="card-value" id="realized">-</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Win Rate</div>
+      <div class="card-value" id="winrate">-</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Open Positions</div>
+      <div class="card-value neutral" id="positions-count">-</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Total Invested</div>
+      <div class="card-value neutral" id="invested">-</div>
+    </div>
   </div>
-  <ul class="wallet-list" id="wallet-list"></ul>
-  <div class="wallet-msg" id="wallet-msg"></div>
+
+  <h2 class="section-title">Open Positions</h2>
+  <table>
+    <thead>
+      <tr><th>Asset</th><th>Shares</th><th>Buy Price</th><th>Current</th><th>Cost</th><th>Value</th><th>P&amp;L</th><th>Opened</th></tr>
+    </thead>
+    <tbody id="positions-body"><tr><td colspan="8">Loading...</td></tr></tbody>
+  </table>
+  <div class="pagination" id="positions-pagination"></div>
+
+  <h2 class="section-title">Recent Closed Trades</h2>
+  <table>
+    <thead>
+      <tr><th>Asset</th><th>Buy</th><th>Sell</th><th>Shares</th><th>P&amp;L</th><th>Opened</th><th>Closed</th></tr>
+    </thead>
+    <tbody id="history-body"><tr><td colspan="7">Loading...</td></tr></tbody>
+  </table>
+  <div class="pagination" id="history-pagination"></div>
 </div>
 
-<h2 class="section-title">Open Positions</h2>
-<table>
-  <thead>
-    <tr><th>Asset</th><th>Shares</th><th>Buy Price</th><th>Current</th><th>Cost</th><th>Value</th><th>P&amp;L</th><th>Opened</th></tr>
-  </thead>
-  <tbody id="positions-body"><tr><td colspan="8">Loading...</td></tr></tbody>
-</table>
-<div class="pagination" id="positions-pagination"></div>
-
-<h2 class="section-title">Recent Closed Trades</h2>
-<table>
-  <thead>
-    <tr><th>Asset</th><th>Buy</th><th>Sell</th><th>Shares</th><th>P&amp;L</th><th>Opened</th><th>Closed</th></tr>
-  </thead>
-  <tbody id="history-body"><tr><td colspan="7">Loading...</td></tr></tbody>
-</table>
-<div class="pagination" id="history-pagination"></div>
+<div id="tab-wallets" class="tab-pane">
+  <div class="wallets-section">
+    <div class="wallet-add">
+      <input type="text" id="wallet-input" placeholder="0x... wallet address" />
+      <button onclick="addWallet()">Add Wallet</button>
+    </div>
+    <div class="wallet-msg" id="wallet-msg"></div>
+    <div class="wallet-count" id="wallet-count"></div>
+    <ul class="wallet-list" id="wallet-list"></ul>
+    <div class="pagination" id="wallets-pagination"></div>
+  </div>
+</div>
 
 <div class="footer">Auto-refreshes every 10s</div>
 
 <script>
 const PAGE_SIZE = 10;
-let posPage = 0, histPage = 0;
+let posPage = 0, histPage = 0, walletPage = 0;
 let lastData = null;
+
+function switchTab(name) {
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  document.querySelector('.tab-btn[onclick*="' + name + '"]').classList.add('active');
+}
 
 function pnlClass(v) { return v > 0 ? 'positive' : v < 0 ? 'negative' : 'neutral'; }
 function fmt(v, prefix) {
@@ -360,18 +384,35 @@ async function refresh() {
   } catch(e) { console.error('Dashboard refresh failed', e); }
 }
 
+function changeWalletPage(delta) {
+  if (!lastData) return;
+  const maxPage = Math.max(0, Math.ceil(lastData.tracked_wallets_list.length / PAGE_SIZE) - 1);
+  walletPage = Math.max(0, Math.min(maxPage, walletPage + delta));
+  renderWallets(lastData.tracked_wallets_list);
+}
+
 function renderWallets(wallets) {
   const wl = document.getElementById('wallet-list');
+  const wc = document.getElementById('wallet-count');
   if (!wallets || wallets.length === 0) {
-    wl.innerHTML = '<li style="color:#8b949e; padding:6px 0;">No wallets tracked</li>';
+    wl.innerHTML = '<li style="color:#8b949e; padding:10px 0;">No wallets tracked. Add one above.</li>';
+    wc.textContent = '';
+    renderPagination('wallets-pagination', 0, 0, 'changeWalletPage');
     return;
   }
-  wl.innerHTML = wallets.map(w =>
+  wc.textContent = wallets.length + ' wallet' + (wallets.length !== 1 ? 's' : '') + ' tracked';
+  const maxPage = Math.max(0, Math.ceil(wallets.length / PAGE_SIZE) - 1);
+  if (walletPage > maxPage) walletPage = maxPage;
+  const page = paginate(wallets, walletPage);
+  const offset = walletPage * PAGE_SIZE;
+  wl.innerHTML = page.map((w, i) =>
     '<li class="wallet-item">' +
+      '<span class="wallet-idx">#' + (offset + i + 1) + '</span>' +
       '<span class="addr">' + w + '</span>' +
       '<button data-wallet="' + w + '" onclick="removeWallet(this.dataset.wallet)">Remove</button>' +
     '</li>'
   ).join('');
+  renderPagination('wallets-pagination', wallets.length, walletPage, 'changeWalletPage');
 }
 
 function showWalletMsg(text, isError) {
