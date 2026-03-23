@@ -1,0 +1,32 @@
+[project]
+name = "polymarket-copy-bot"
+version = "0.1.0"
+description = "A copy-trading bot that tracks Polymarket traders and replicates their trades."
+requires-python = ">=3.11"
+dependencies = [
+    "py-clob-client>=0.17.0",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "structlog>=24.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+copy-bot = "polymarket_copy_bot.main:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
