@@ -17,6 +17,7 @@ import structlog
 if TYPE_CHECKING:
     from polymarket_copy_bot.client import PolymarketClient
     from polymarket_copy_bot.copier import TradeCopier
+    from polymarket_copy_bot.tracker import TradeTracker
 
 logger = structlog.get_logger()
 
@@ -142,6 +143,25 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .pagination button:hover { background: #30363d; }
   .pagination button:disabled { opacity: 0.4; cursor: default; }
   .pagination .page-info { color: #8b949e; font-size: 0.8em; }
+  .wallets-section { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 16px; margin-bottom: 24px; }
+  .wallets-section h2 { font-size: 1em; color: #58a6ff; margin-bottom: 12px; }
+  .wallet-add { display: flex; gap: 8px; margin-bottom: 12px; }
+  .wallet-add input { flex: 1; background: #0d1117; border: 1px solid #30363d; border-radius: 4px;
+    color: #c9d1d9; padding: 6px 10px; font-family: monospace; font-size: 0.85em; }
+  .wallet-add input::placeholder { color: #484f58; }
+  .wallet-add button { background: #238636; color: #fff; border: none; border-radius: 4px;
+    padding: 6px 14px; cursor: pointer; font-size: 0.85em; white-space: nowrap; }
+  .wallet-add button:hover { background: #2ea043; }
+  .wallet-list { list-style: none; }
+  .wallet-item { display: flex; justify-content: space-between; align-items: center;
+    padding: 6px 0; border-bottom: 1px solid #21262d; font-family: monospace; font-size: 0.85em; }
+  .wallet-item:last-child { border-bottom: none; }
+  .wallet-item .addr { color: #8b949e; overflow: hidden; text-overflow: ellipsis; }
+  .wallet-item button { background: #da3633; color: #fff; border: none; border-radius: 4px;
+    padding: 3px 10px; cursor: pointer; font-size: 0.75em; }
+  .wallet-item button:hover { background: #f85149; }
+  .wallet-msg { font-size: 0.8em; margin-top: 6px; min-height: 1.2em; }
   .footer { color: #484f58; font-size: 0.75em; margin-top: 24px; }
   @media (max-width: 600px) {
     .cards { grid-template-columns: 1fr 1fr; }
@@ -178,6 +198,16 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="card-label">Total Invested</div>
     <div class="card-value neutral" id="invested">-</div>
   </div>
+</div>
+
+<div class="wallets-section">
+  <h2>Tracked Wallets</h2>
+  <div class="wallet-add">
+    <input type="text" id="wallet-input" placeholder="0x... wallet address" />
+    <button onclick="addWallet()">Add Wallet</button>
+  </div>
+  <ul class="wallet-list" id="wallet-list"></ul>
+  <div class="wallet-msg" id="wallet-msg"></div>
 </div>
 
 <h2 class="section-title">Open Positions</h2>
@@ -324,9 +354,57 @@ async function refresh() {
     const maxHistPage = Math.max(0, Math.ceil(d.recent_trades.length / PAGE_SIZE) - 1);
     if (histPage > maxHistPage) histPage = maxHistPage;
 
+    renderWallets(d.tracked_wallets_list);
     renderPositions(d);
     renderHistory(d);
   } catch(e) { console.error('Dashboard refresh failed', e); }
+}
+
+function renderWallets(wallets) {
+  const wl = document.getElementById('wallet-list');
+  if (!wallets || wallets.length === 0) {
+    wl.innerHTML = '<li style="color:#8b949e; padding:6px 0;">No wallets tracked</li>';
+    return;
+  }
+  wl.innerHTML = wallets.map(w =>
+    '<li class="wallet-item">' +
+      '<span class="addr">' + w + '</span>' +
+      '<button data-wallet="' + w + '" onclick="removeWallet(this.dataset.wallet)">Remove</button>' +
+    '</li>'
+  ).join('');
+}
+
+function showWalletMsg(text, isError) {
+  const el = document.getElementById('wallet-msg');
+  el.textContent = text;
+  el.style.color = isError ? '#f85149' : '#3fb950';
+  setTimeout(() => { el.textContent = ''; }, 4000);
+}
+
+async function addWallet() {
+  const input = document.getElementById('wallet-input');
+  const addr = input.value.trim().toLowerCase();
+  if (!addr) return;
+  if (!/^0x[a-f0-9]{40}$/i.test(addr)) { showWalletMsg('Invalid address — must be 0x + 40 hex chars', true); return; }
+  try {
+    const r = await fetch('/api/wallets', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({wallet:addr})});
+    const d = await r.json();
+    if (d.error) { showWalletMsg(d.error, true); return; }
+    input.value = '';
+    showWalletMsg('Added ' + addr.slice(0,8) + '...', false);
+    refresh();
+  } catch(e) { showWalletMsg('Failed to add wallet', true); }
+}
+
+async function removeWallet(addr) {
+  if (!confirm('Remove wallet ' + addr.slice(0,10) + '... from tracking?')) return;
+  try {
+    const r = await fetch('/api/wallets', {method:'DELETE', headers:{'Content-Type':'application/json'}, body:JSON.stringify({wallet:addr})});
+    const d = await r.json();
+    if (d.error) { showWalletMsg(d.error, true); return; }
+    showWalletMsg('Removed ' + addr.slice(0,8) + '...', false);
+    refresh();
+  } catch(e) { showWalletMsg('Failed to remove wallet', true); }
 }
 
 refresh();
@@ -336,27 +414,85 @@ setInterval(refresh, 10000);
 </html>"""
 
 
+def _add_wallet(copier: TradeCopier, tracker: TradeTracker, wallet: str) -> dict[str, Any]:
+    """Add a wallet to tracking. Updates copier config, tracker config, and persists."""
+    wallet = wallet.strip().lower()
+    if not wallet or len(wallet) != 42 or not wallet.startswith("0x"):
+        return {"error": "Invalid wallet address"}
+    if wallet in copier.config.tracked_wallets:
+        return {"error": "Wallet already tracked"}
+
+    copier.config.tracked_wallets.append(wallet)
+    tracker.config.tracked_wallets = copier.config.tracked_wallets
+    copier._save()
+    logger.info("wallet_added", wallet=wallet[:10] + "...")
+    return {"ok": True, "wallets": len(copier.config.tracked_wallets)}
+
+
+def _remove_wallet(copier: TradeCopier, tracker: TradeTracker, wallet: str) -> dict[str, Any]:
+    """Remove a wallet from tracking."""
+    wallet = wallet.strip().lower()
+    if wallet not in copier.config.tracked_wallets:
+        return {"error": "Wallet not found"}
+
+    copier.config.tracked_wallets.remove(wallet)
+    tracker.config.tracked_wallets = copier.config.tracked_wallets
+    copier._save()
+    logger.info("wallet_removed", wallet=wallet[:10] + "...")
+    return {"ok": True, "wallets": len(copier.config.tracked_wallets)}
+
+
 class _DashboardHandler(BaseHTTPRequestHandler):
     """Handles HTTP requests for the dashboard."""
 
     copier: TradeCopier
     client: PolymarketClient
+    tracker: TradeTracker
+
+    def _send_json(self, data: dict, status: int = 200) -> None:
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0:
+            return {}
+        return json.loads(self.rfile.read(length))
 
     def do_GET(self) -> None:
         if self.path == "/api/data":
             data = _build_dashboard_data(self.copier, self.client)
-            body = json.dumps(data).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_json(data)
         elif self.path == "/" or self.path == "/index.html":
             body = _HTML_TEMPLATE.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self) -> None:
+        if self.path == "/api/wallets":
+            data = self._read_body()
+            wallet = data.get("wallet", "")
+            result = _add_wallet(self.copier, self.tracker, wallet)
+            self._send_json(result, 200 if "ok" in result else 400)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_DELETE(self) -> None:
+        if self.path == "/api/wallets":
+            data = self._read_body()
+            wallet = data.get("wallet", "")
+            result = _remove_wallet(self.copier, self.tracker, wallet)
+            self._send_json(result, 200 if "ok" in result else 400)
         else:
             self.send_response(404)
             self.end_headers()
@@ -369,13 +505,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 def start_dashboard(
     copier: TradeCopier,
     client: PolymarketClient,
+    tracker: TradeTracker,
     port: int = 8080,
 ) -> HTTPServer:
     """Start the dashboard HTTP server in a background daemon thread."""
     handler = type(
         "Handler",
         (_DashboardHandler,),
-        {"copier": copier, "client": client},
+        {"copier": copier, "client": client, "tracker": tracker},
     )
     server = HTTPServer(("0.0.0.0", port), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

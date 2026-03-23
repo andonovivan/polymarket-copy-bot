@@ -76,7 +76,7 @@ def main() -> None:
     copier.reconcile_on_startup()
 
     # Start web dashboard.
-    start_dashboard(copier, client, port=config.dashboard_port)
+    start_dashboard(copier, client, tracker, port=config.dashboard_port)
 
     # --- Main loop ---
     low_balance_logged = False

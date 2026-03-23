@@ -65,13 +65,14 @@ class BotConfig(BaseModel):
     @classmethod
     def from_env(cls) -> BotConfig:
         """Build config. Tracked wallets are read from bot_state.json first, .env as fallback."""
+        # Merge wallets from DB and .env (DB wallets first, then any new ones from .env).
         state = load_state()
-        wallets = state.get("tracked_wallets", [])
-        if not wallets:
-            wallets_raw = os.getenv("TRACKED_WALLETS", "")
-            wallets = [w.strip() for w in wallets_raw.split(",") if w.strip()]
+        db_wallets = state.get("tracked_wallets", [])
+        env_raw = os.getenv("TRACKED_WALLETS", "")
+        env_wallets = [w.strip() for w in env_raw.split(",") if w.strip()]
+        combined = db_wallets + env_wallets
         # Deduplicate while preserving order.
-        wallets = list(dict.fromkeys(w.lower() for w in wallets))
+        wallets = list(dict.fromkeys(w.lower() for w in combined))
 
         return cls(
             clob_api_url=os.getenv("CLOB_API_URL", "https://clob.polymarket.com"),
