@@ -64,8 +64,8 @@ class PolymarketClient:
             # API returns {"mid": "0.725"} (docs say mid_price but actual response uses mid)
             value = float(mid.get("mid", 0)) if mid else 0
             return value if value > 0 else None
-        except Exception:
-            logger.warning("midpoint_fetch_failed", token_id=token_id)
+        except Exception as exc:
+            logger.warning("midpoint_fetch_failed", token_id=token_id, error=str(exc)[:120])
             return None
 
     # ------------------------------------------------------------------

@@ -55,19 +55,24 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 # Cache midpoint lookups so we don't hammer the API on every page refresh.
-_price_cache: dict[str, tuple[float, float]] = {}  # asset_id -> (price, timestamp)
-_CACHE_TTL = 15  # seconds
+# Stores (price_or_None, timestamp). Successful lookups cached for 15s,
+# failures cached for 5 minutes to avoid spamming the API for dead markets.
+_price_cache: dict[str, tuple[float | None, float]] = {}
+_CACHE_TTL = 15  # seconds for successful lookups
+_FAIL_CACHE_TTL = 300  # seconds for failed lookups (5 min)
 
 
 def _get_cached_midpoint(client: PolymarketClient, asset_id: str) -> float | None:
-    """Get midpoint with a short TTL cache."""
+    """Get midpoint with a short TTL cache. Caches failures too."""
     now = time.time()
     cached = _price_cache.get(asset_id)
-    if cached and now - cached[1] < _CACHE_TTL:
-        return cached[0]
+    if cached is not None:
+        price, ts = cached
+        ttl = _CACHE_TTL if price is not None else _FAIL_CACHE_TTL
+        if now - ts < ttl:
+            return price
     mid = client.get_midpoint(asset_id)
-    if mid is not None:
-        _price_cache[asset_id] = (mid, now)
+    _price_cache[asset_id] = (mid, now)
     return mid
 
 
