@@ -79,6 +79,12 @@ class Bar:
     v: float
 
 
+@dataclass
+class FundingPoint:
+    funding_ts: int
+    rate: float
+
+
 # ---------------------------------------------------------------------------
 # Markets
 # ---------------------------------------------------------------------------
@@ -273,6 +279,105 @@ def load_bars(from_ts: int | None = None, to_ts: int | None = None, limit: int |
     if limit is not None:
         sql += " LIMIT ?"; args.append(limit)
     return [Bar(*r) for r in conn.execute(sql, args).fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Aux bars (ETH spot, BTC perp) — same shape as btc_bars, different tables
+# ---------------------------------------------------------------------------
+
+
+def _upsert_into(table: str, bars: list[Bar]) -> int:
+    if not bars:
+        return 0
+    conn = get_conn()
+    with lock():
+        conn.executemany(
+            f"INSERT OR REPLACE INTO {table} (open_time, o, h, l, c, v) VALUES (?, ?, ?, ?, ?, ?)",
+            [(b.open_time, b.o, b.h, b.l, b.c, b.v) for b in bars],
+        )
+        conn.commit()
+    return len(bars)
+
+
+def _load_from(table: str, from_ts: int | None = None, to_ts: int | None = None,
+               limit: int | None = None) -> list[Bar]:
+    conn = get_conn()
+    sql = f"SELECT open_time, o, h, l, c, v FROM {table} WHERE 1=1"
+    args: list[Any] = []
+    if from_ts is not None:
+        sql += " AND open_time>=?"; args.append(from_ts)
+    if to_ts is not None:
+        sql += " AND open_time<?"; args.append(to_ts)
+    sql += " ORDER BY open_time"
+    if limit is not None:
+        sql += " LIMIT ?"; args.append(limit)
+    return [Bar(*r) for r in conn.execute(sql, args).fetchall()]
+
+
+def _latest_open_time(table: str) -> int | None:
+    conn = get_conn()
+    row = conn.execute(f"SELECT MAX(open_time) FROM {table}").fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def upsert_eth_bars(bars: list[Bar]) -> int:
+    return _upsert_into("eth_bars", bars)
+
+
+def load_eth_bars(from_ts: int | None = None, to_ts: int | None = None) -> list[Bar]:
+    return _load_from("eth_bars", from_ts, to_ts)
+
+
+def latest_eth_bar_time() -> int | None:
+    return _latest_open_time("eth_bars")
+
+
+def upsert_perp_bars(bars: list[Bar]) -> int:
+    return _upsert_into("btc_perp_bars", bars)
+
+
+def load_perp_bars(from_ts: int | None = None, to_ts: int | None = None) -> list[Bar]:
+    return _load_from("btc_perp_bars", from_ts, to_ts)
+
+
+def latest_perp_bar_time() -> int | None:
+    return _latest_open_time("btc_perp_bars")
+
+
+# ---------------------------------------------------------------------------
+# Funding rate (BTC perp, every 8h)
+# ---------------------------------------------------------------------------
+
+
+def upsert_funding(points: list[FundingPoint]) -> int:
+    if not points:
+        return 0
+    conn = get_conn()
+    with lock():
+        conn.executemany(
+            "INSERT OR REPLACE INTO btc_funding (funding_ts, rate) VALUES (?, ?)",
+            [(p.funding_ts, p.rate) for p in points],
+        )
+        conn.commit()
+    return len(points)
+
+
+def load_funding(from_ts: int | None = None, to_ts: int | None = None) -> list[FundingPoint]:
+    conn = get_conn()
+    sql = "SELECT funding_ts, rate FROM btc_funding WHERE 1=1"
+    args: list[Any] = []
+    if from_ts is not None:
+        sql += " AND funding_ts>=?"; args.append(from_ts)
+    if to_ts is not None:
+        sql += " AND funding_ts<?"; args.append(to_ts)
+    sql += " ORDER BY funding_ts"
+    return [FundingPoint(int(r[0]), float(r[1])) for r in conn.execute(sql, args).fetchall()]
+
+
+def latest_funding_ts() -> int | None:
+    conn = get_conn()
+    row = conn.execute("SELECT MAX(funding_ts) FROM btc_funding").fetchone()
+    return int(row[0]) if row and row[0] is not None else None
 
 
 # ---------------------------------------------------------------------------

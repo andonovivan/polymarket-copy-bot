@@ -87,6 +87,29 @@ CREATE TABLE IF NOT EXISTS btc_bars (
     v REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS eth_bars (
+    open_time  INTEGER PRIMARY KEY,
+    o REAL NOT NULL,
+    h REAL NOT NULL,
+    l REAL NOT NULL,
+    c REAL NOT NULL,
+    v REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS btc_perp_bars (
+    open_time  INTEGER PRIMARY KEY,
+    o REAL NOT NULL,
+    h REAL NOT NULL,
+    l REAL NOT NULL,
+    c REAL NOT NULL,
+    v REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS btc_funding (
+    funding_ts  INTEGER PRIMARY KEY,
+    rate        REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS polymarket_quotes (
     market_id  TEXT NOT NULL,
     ts         INTEGER NOT NULL,
@@ -106,8 +129,14 @@ CREATE TABLE IF NOT EXISTS models (
     window_start      INTEGER NOT NULL,
     window_end        INTEGER NOT NULL,
     payload           BLOB NOT NULL,
+    feature_names     TEXT,                    -- JSON list, used to validate at load
     cv_brier          REAL,
     cv_logloss        REAL,
+    cv_brier_baseline REAL,                    -- no-skill baseline (constant 0.5) Brier
+    cv_p_value        REAL,                    -- bootstrap one-sided p-value
+    cv_brier_ci_lo    REAL,
+    cv_brier_ci_hi    REAL,
+    cv_folds          INTEGER,
     calib_intercept   REAL,
     calib_slope       REAL
 );
@@ -120,6 +149,24 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
+_MODELS_NEW_COLUMNS = [
+    ("feature_names", "TEXT"),
+    ("cv_brier_baseline", "REAL"),
+    ("cv_p_value", "REAL"),
+    ("cv_brier_ci_lo", "REAL"),
+    ("cv_brier_ci_hi", "REAL"),
+    ("cv_folds", "INTEGER"),
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply ALTER TABLE migrations for columns added after the initial schema."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(models)")}
+    for col, type_ in _MODELS_NEW_COLUMNS:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE models ADD COLUMN {col} {type_}")
+
+
 def get_conn(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     """Get or create the singleton SQLite connection."""
     global _conn
@@ -130,6 +177,7 @@ def get_conn(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _conn.execute("PRAGMA busy_timeout=5000")
     _conn.execute("PRAGMA foreign_keys=ON")
     _conn.executescript(SCHEMA_DDL)
+    _migrate(_conn)
     _conn.commit()
     return _conn
 

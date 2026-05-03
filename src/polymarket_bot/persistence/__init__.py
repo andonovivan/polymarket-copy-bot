@@ -3,6 +3,7 @@
 from polymarket_bot.persistence.repo import (
     Bar,
     Bet,
+    FundingPoint,
     Market,
     Trade,
     append_equity,
@@ -13,20 +14,29 @@ from polymarket_bot.persistence.repo import (
     insert_trade,
     latest_bar_time,
     latest_equity,
+    latest_eth_bar_time,
+    latest_funding_ts,
+    latest_perp_bar_time,
     list_trades,
     load_bars,
+    load_eth_bars,
+    load_funding,
+    load_perp_bars,
     mark_bet_settled,
     open_bets,
     set_meta,
     settle_market,
     trade_stats,
     upsert_bars,
+    upsert_eth_bars,
+    upsert_funding,
     upsert_market,
+    upsert_perp_bars,
 )
 from polymarket_bot.persistence.schema import init_db
 
 __all__ = [
-    "Bar", "Bet", "Market", "Trade",
+    "Bar", "Bet", "FundingPoint", "Market", "Trade",
     "init_db",
     "append_equity", "equity_curve", "latest_equity",
     "get_market", "settle_market", "upsert_market",
@@ -34,4 +44,7 @@ __all__ = [
     "insert_bet", "open_bets", "mark_bet_settled",
     "insert_trade", "list_trades", "trade_stats",
     "upsert_bars", "latest_bar_time", "load_bars",
+    "upsert_eth_bars", "load_eth_bars", "latest_eth_bar_time",
+    "upsert_perp_bars", "load_perp_bars", "latest_perp_bar_time",
+    "upsert_funding", "load_funding", "latest_funding_ts",
 ]

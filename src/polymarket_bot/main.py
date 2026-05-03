@@ -213,17 +213,42 @@ def _settle_due_markets(config: BotConfig) -> None:
 
 def cmd_backfill(config: BotConfig, args: argparse.Namespace) -> None:
     init_db()
-    new_bars = backfill(days=args.days)
-    print(f"Inserted {new_bars} new BTC bars (last {args.days} days).")
+    new_btc = backfill(days=args.days)
+    print(f"BTC: {new_btc} bars")
+    if not args.no_aux:
+        from polymarket_bot.data.aux_feed import backfill_all_aux
+        aux = backfill_all_aux(days=args.days)
+        print(f"ETH: {aux['eth']} bars | BTC perp: {aux['btc_perp']} bars | "
+              f"funding: {aux['funding']} points")
 
 
 def cmd_train(config: BotConfig, args: argparse.Namespace) -> None:
     init_db()
-    model = train_logit(window_days=args.window_days)
+    from polymarket_bot.model.trainer import cv_metrics_for_active_model
+    model = train_logit(
+        window_days=args.window_days,
+        cv=not args.no_cv,
+        cv_train_days=args.cv_train_days,
+        cv_step_days=args.cv_step_days,
+    )
     if model is None:
         print("Training failed — likely insufficient bars. Run `polymarket-bot backfill` first.")
         sys.exit(1)
-    print(f"Trained {model.version}")
+    print(f"\nTrained {model.version}\n")
+    cv = cv_metrics_for_active_model()
+    if cv and cv.get("cv_brier") is not None:
+        edge_pp = (cv["cv_brier_baseline"] - cv["cv_brier"]) * 100
+        sig = "***" if cv["cv_p_value"] < 0.01 else ("**" if cv["cv_p_value"] < 0.05 else (
+              "*"  if cv["cv_p_value"] < 0.10 else "ns"))
+        print("Walk-forward OOS performance:")
+        print(f"  folds:           {cv['cv_folds']}")
+        print(f"  Brier (model):   {cv['cv_brier']:.5f}")
+        print(f"  Brier (no-skill): {cv['cv_brier_baseline']:.5f}")
+        print(f"  edge:            {edge_pp:+.3f} pp Brier (positive = model better)")
+        print(f"  95% CI on diff:  [{cv['cv_brier_ci_lo']:+.5f}, {cv['cv_brier_ci_hi']:+.5f}]")
+        print(f"  p-value:         {cv['cv_p_value']:.4f}  ({sig})")
+        if cv["cv_p_value"] >= 0.05:
+            print("\n  ⚠️  No statistically significant edge. Don't bet real money on this.")
 
 
 def cmd_backtest(config: BotConfig, args: argparse.Namespace) -> None:
@@ -273,11 +298,20 @@ def main() -> None:
     p_run.add_argument("--live", action="store_true",
                        help="Place real orders (requires POLYMARKET_BOT_LIVE=1).")
 
-    p_bf = sub.add_parser("backfill", help="Cache historical BTC 5m bars from Binance.")
-    p_bf.add_argument("--days", type=int, default=60)
+    p_bf = sub.add_parser("backfill", help="Cache BTC + aux (ETH spot, BTC perp, funding) bars.")
+    p_bf.add_argument("--days", type=int, default=365)
+    p_bf.add_argument("--no-aux", action="store_true",
+                      help="Skip ETH / perp / funding (BTC only).")
 
-    p_tr = sub.add_parser("train", help="Train a strategy's probability model from cached bars.")
-    p_tr.add_argument("--window-days", type=int, default=60)
+    p_tr = sub.add_parser("train", help="Train a strategy's probability model with walk-forward CV.")
+    p_tr.add_argument("--window-days", type=int, default=365,
+                      help="Total span of data used for the final fit.")
+    p_tr.add_argument("--cv-train-days", type=int, default=60,
+                      help="Per-fold training window for walk-forward.")
+    p_tr.add_argument("--cv-step-days", type=int, default=14,
+                      help="Step between folds.")
+    p_tr.add_argument("--no-cv", action="store_true",
+                      help="Skip walk-forward CV (faster but no honest OOS metrics).")
 
     p_bt = sub.add_parser("backtest", help="Replay cached bars + recorded quotes through a strategy.")
     p_bt.add_argument("--strategy", default="momentum_logit")

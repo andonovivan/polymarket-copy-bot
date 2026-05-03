@@ -73,7 +73,14 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
         rows = list_trades(limit=limit, offset=offset, side=side, strategy=strat, from_ts=f, to_ts=t)
         return 200, {"trades": [_trade_dict(r) for r in rows], "page": offset // limit, "size": limit}
     if path == "/api/strategies":
-        return 200, {"strategies": [{"name": n, "enabled": (config.strategy == n if config else False)} for n in list_strategies()]}
+        from polymarket_bot.model.trainer import cv_metrics_for_active_model
+        return 200, {
+            "strategies": [
+                {"name": n, "enabled": (config.strategy == n if config else False)}
+                for n in list_strategies()
+            ],
+            "active_model": cv_metrics_for_active_model(),
+        }
     if path == "/api/settings":
         if config is None:
             return 200, {}
