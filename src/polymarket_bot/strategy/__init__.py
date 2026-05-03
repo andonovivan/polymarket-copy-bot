@@ -1,11 +1,24 @@
-"""Strategy interface, registry, and built-in strategies."""
+"""Market-making strategy interface, types, and built-in strategies."""
 
-from polymarket_bot.strategy.base import Bet, Strategy, StrategyContext
-from polymarket_bot.strategy.momentum_logit import MomentumLogitStrategy
-from polymarket_bot.strategy.registry import get_strategy_class, register_strategy
+from polymarket_bot.strategy.base import (
+    CancelOrder,
+    Inventory,
+    MMState,
+    MMStrategy,
+    OpenOrder,
+    OrderAction,
+    PlaceLimit,
+)
+from polymarket_bot.strategy.registry import (
+    get_strategy_class,
+    list_strategies,
+    register_strategy,
+)
+from polymarket_bot.strategy.spread_only import SpreadOnlyMM
 
 __all__ = [
-    "Strategy", "StrategyContext", "Bet",
-    "MomentumLogitStrategy",
-    "register_strategy", "get_strategy_class",
+    "MMStrategy", "MMState", "Inventory", "OpenOrder",
+    "OrderAction", "PlaceLimit", "CancelOrder",
+    "SpreadOnlyMM",
+    "get_strategy_class", "list_strategies", "register_strategy",
 ]

@@ -1,4 +1,8 @@
-"""SQLite schema and connection management for polymarket-bot."""
+"""SQLite schema and connection management for polymarket-bot (MM mode).
+
+Schema is purpose-built for market-making: orders + fills + markets + equity.
+The legacy direction-prediction tables are dropped on first boot.
+"""
 
 from __future__ import annotations
 
@@ -31,116 +35,60 @@ CREATE TABLE IF NOT EXISTS markets (
 );
 CREATE INDEX IF NOT EXISTS idx_markets_resolution ON markets(resolution_ts);
 
-CREATE TABLE IF NOT EXISTS bets (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    market_id      TEXT NOT NULL,
-    side           TEXT NOT NULL,
-    shares         REAL NOT NULL,
-    entry_price    REAL NOT NULL,
-    stake          REAL NOT NULL,
-    predicted_p    REAL NOT NULL,
-    market_p       REAL NOT NULL,
-    edge           REAL NOT NULL,
-    strategy       TEXT NOT NULL,
-    model_version  TEXT NOT NULL,
-    opened_at      INTEGER NOT NULL,
-    status         TEXT NOT NULL DEFAULT 'open',
+CREATE TABLE IF NOT EXISTS orders (
+    order_id        TEXT PRIMARY KEY,
+    client_order_id TEXT NOT NULL,
+    market_id       TEXT NOT NULL,
+    token_side      TEXT NOT NULL,                 -- 'YES' | 'NO'
+    side            TEXT NOT NULL,                 -- 'BUY' | 'SELL'
+    price           REAL NOT NULL,
+    size            REAL NOT NULL,
+    filled          REAL NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'open',  -- 'open' | 'filled' | 'cancelled' | 'expired'
+    placed_at       INTEGER NOT NULL,
+    ended_at        INTEGER,
+    strategy        TEXT NOT NULL,
     FOREIGN KEY (market_id) REFERENCES markets(market_id)
 );
-CREATE INDEX IF NOT EXISTS idx_bets_status ON bets(status);
-CREATE INDEX IF NOT EXISTS idx_bets_market ON bets(market_id);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+CREATE INDEX IF NOT EXISTS idx_orders_market ON orders(market_id);
+CREATE INDEX IF NOT EXISTS idx_orders_client ON orders(client_order_id);
 
-CREATE TABLE IF NOT EXISTS trades (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    market_id      TEXT NOT NULL,
-    side           TEXT NOT NULL,
-    shares         REAL NOT NULL,
-    entry_price    REAL NOT NULL,
-    payout         REAL NOT NULL,
-    pnl            REAL NOT NULL,
-    fees           REAL NOT NULL DEFAULT 0,
-    slippage       REAL NOT NULL DEFAULT 0,
-    predicted_p    REAL NOT NULL,
-    market_p       REAL NOT NULL,
-    edge           REAL NOT NULL,
-    brier          REAL NOT NULL,
-    outcome        TEXT NOT NULL,
-    strategy       TEXT NOT NULL,
-    model_version  TEXT NOT NULL,
-    opened_at      INTEGER NOT NULL,
-    settled_at     INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS fills (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id    TEXT NOT NULL,
+    market_id   TEXT NOT NULL,
+    token_side  TEXT NOT NULL,
+    side        TEXT NOT NULL,
+    price       REAL NOT NULL,
+    size        REAL NOT NULL,
+    fill_ts     INTEGER NOT NULL,
+    strategy    TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES orders(order_id),
+    FOREIGN KEY (market_id) REFERENCES markets(market_id)
 );
-CREATE INDEX IF NOT EXISTS idx_trades_settled ON trades(settled_at);
-CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy);
+CREATE INDEX IF NOT EXISTS idx_fills_market ON fills(market_id);
+CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(fill_ts);
+
+CREATE TABLE IF NOT EXISTS settlements (
+    market_id      TEXT PRIMARY KEY,
+    settled_at     INTEGER NOT NULL,
+    outcome        TEXT NOT NULL,                  -- 'UP' | 'DOWN'
+    yes_shares     REAL NOT NULL,
+    no_shares      REAL NOT NULL,
+    avg_yes_cost   REAL NOT NULL,
+    avg_no_cost    REAL NOT NULL,
+    payout         REAL NOT NULL,
+    cost           REAL NOT NULL,
+    pnl            REAL NOT NULL,
+    strategy       TEXT NOT NULL,
+    FOREIGN KEY (market_id) REFERENCES markets(market_id)
+);
 
 CREATE TABLE IF NOT EXISTS equity_curve (
     ts      INTEGER PRIMARY KEY,
     equity  REAL NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS btc_bars (
-    open_time  INTEGER PRIMARY KEY,
-    o REAL NOT NULL,
-    h REAL NOT NULL,
-    l REAL NOT NULL,
-    c REAL NOT NULL,
-    v REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS eth_bars (
-    open_time  INTEGER PRIMARY KEY,
-    o REAL NOT NULL,
-    h REAL NOT NULL,
-    l REAL NOT NULL,
-    c REAL NOT NULL,
-    v REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS btc_perp_bars (
-    open_time  INTEGER PRIMARY KEY,
-    o REAL NOT NULL,
-    h REAL NOT NULL,
-    l REAL NOT NULL,
-    c REAL NOT NULL,
-    v REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS btc_funding (
-    funding_ts  INTEGER PRIMARY KEY,
-    rate        REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS polymarket_quotes (
-    market_id  TEXT NOT NULL,
-    ts         INTEGER NOT NULL,
-    yes_bid    REAL,
-    yes_ask    REAL,
-    no_bid     REAL,
-    no_ask     REAL,
-    depth_yes  REAL,
-    depth_no   REAL,
-    PRIMARY KEY (market_id, ts)
-);
-
-CREATE TABLE IF NOT EXISTS models (
-    version           TEXT PRIMARY KEY,
-    strategy          TEXT NOT NULL,
-    trained_at        INTEGER NOT NULL,
-    window_start      INTEGER NOT NULL,
-    window_end        INTEGER NOT NULL,
-    payload           BLOB NOT NULL,
-    feature_names     TEXT,                    -- JSON list, used to validate at load
-    cv_brier          REAL,
-    cv_logloss        REAL,
-    cv_brier_baseline REAL,                    -- no-skill baseline (constant 0.5) Brier
-    cv_p_value        REAL,                    -- bootstrap one-sided p-value
-    cv_brier_ci_lo    REAL,
-    cv_brier_ci_hi    REAL,
-    cv_folds          INTEGER,
-    calib_intercept   REAL,
-    calib_slope       REAL
-);
-CREATE INDEX IF NOT EXISTS idx_models_strategy ON models(strategy, trained_at DESC);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -149,22 +97,20 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
-_MODELS_NEW_COLUMNS = [
-    ("feature_names", "TEXT"),
-    ("cv_brier_baseline", "REAL"),
-    ("cv_p_value", "REAL"),
-    ("cv_brier_ci_lo", "REAL"),
-    ("cv_brier_ci_hi", "REAL"),
-    ("cv_folds", "INTEGER"),
+# Legacy tables from the direction-prediction era. Drop on first boot of the MM build.
+_LEGACY_TABLES = [
+    "bets", "trades",
+    "btc_bars", "eth_bars", "btc_perp_bars", "btc_funding",
+    "polymarket_quotes", "models",
 ]
 
 
-def _migrate(conn: sqlite3.Connection) -> None:
-    """Apply ALTER TABLE migrations for columns added after the initial schema."""
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(models)")}
-    for col, type_ in _MODELS_NEW_COLUMNS:
-        if col not in cols:
-            conn.execute(f"ALTER TABLE models ADD COLUMN {col} {type_}")
+def _drop_legacy(conn: sqlite3.Connection) -> None:
+    for t in _LEGACY_TABLES:
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {t}")
+        except Exception as exc:
+            logger.warning("legacy_drop_failed", table=t, error=str(exc))
 
 
 def get_conn(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -176,8 +122,8 @@ def get_conn(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _conn.execute("PRAGMA journal_mode=WAL")
     _conn.execute("PRAGMA busy_timeout=5000")
     _conn.execute("PRAGMA foreign_keys=ON")
+    _drop_legacy(_conn)
     _conn.executescript(SCHEMA_DDL)
-    _migrate(_conn)
     _conn.commit()
     return _conn
 

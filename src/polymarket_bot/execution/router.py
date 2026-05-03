@@ -1,36 +1,30 @@
-"""Wire up Strategy → Broker → persistence into one path."""
+"""Take a list of OrderActions from the strategy and dispatch through the broker."""
 
 from __future__ import annotations
-
-import time
 
 import structlog
 
 from polymarket_bot.execution.broker import Broker
-from polymarket_bot.persistence.repo import Bet as DbBet, insert_bet
-from polymarket_bot.strategy.base import Bet
+from polymarket_bot.polymarket.markets import DiscoveredMarket
+from polymarket_bot.strategy.base import CancelOrder, OrderAction, PlaceLimit
 
 logger = structlog.get_logger()
 
 
-class Router:
-    """Take a Bet from a strategy, submit it through a broker, persist on success."""
-
-    def __init__(self, broker: Broker) -> None:
+class MMRouter:
+    def __init__(self, broker: Broker, strategy_name: str) -> None:
         self.broker = broker
+        self.strategy_name = strategy_name
 
-    def execute(self, bet: Bet) -> bool:
-        fill = self.broker.submit(bet)
-        if not fill.success:
-            logger.warning("bet_rejected", market_id=bet.market_id[:12], error=fill.error)
-            return False
-        now = int(time.time())
-        insert_bet(DbBet(
-            id=None, market_id=bet.market_id, side=bet.side,
-            shares=fill.filled_shares, entry_price=fill.filled_price,
-            stake=fill.filled_shares * fill.filled_price,
-            predicted_p=bet.predicted_p, market_p=bet.market_p, edge=bet.edge,
-            strategy=bet.strategy, model_version=bet.model_version,
-            opened_at=now, status="open",
-        ))
-        return True
+    def execute(self, actions: list[OrderAction], market: DiscoveredMarket) -> int:
+        n = 0
+        for a in actions:
+            if isinstance(a, PlaceLimit):
+                if self.broker.place_limit(a, market, self.strategy_name):
+                    n += 1
+            elif isinstance(a, CancelOrder):
+                if self.broker.cancel(a.order_id):
+                    n += 1
+            else:
+                logger.warning("unknown_action", action=type(a).__name__)
+        return n

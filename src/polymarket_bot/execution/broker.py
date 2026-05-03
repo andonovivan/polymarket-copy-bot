@@ -1,27 +1,30 @@
-"""Broker interface. One submit() shape for paper, live, and backtest."""
+"""Broker interface for market-making.
+
+Two implementations: PaperMMBroker (simulates fills against the live book) and
+LiveMMBroker (calls the Polymarket CLOB). Both share the same shape so the
+strategy + router code is mode-agnostic.
+"""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 
-from polymarket_bot.strategy.base import Bet
-
-
-@dataclass
-class Fill:
-    """The result of attempting to place a Bet."""
-
-    success: bool
-    filled_price: float       # average per-share price actually paid
-    filled_shares: float      # shares actually filled
-    fees: float               # $ fees taken on this fill
-    slippage: float           # $ slippage relative to expected
-    error: str | None = None
+from polymarket_bot.persistence.repo import Order
+from polymarket_bot.polymarket.markets import DiscoveredMarket
+from polymarket_bot.polymarket.quotes import Quote
+from polymarket_bot.strategy.base import PlaceLimit
 
 
 class Broker(ABC):
-    """Submits bets and reports fills."""
+    """Place and cancel resting limit orders. Must persist to the orders table."""
 
     @abstractmethod
-    def submit(self, bet: Bet) -> Fill: ...
+    def place_limit(self, action: PlaceLimit, market: DiscoveredMarket, strategy: str) -> Order | None:
+        """Place a single limit order. Returns the persisted Order on success."""
+
+    @abstractmethod
+    def cancel(self, order_id: str) -> bool: ...
+
+    @abstractmethod
+    def reconcile_fills(self, market: DiscoveredMarket, quote: Quote) -> int:
+        """Detect fills since the last call and persist them. Returns # of new fills."""

@@ -1,42 +1,88 @@
-"""Live broker: places real orders on the Polymarket CLOB. Gated by --live + env."""
+"""Live broker — places real CLOB limit orders and cancels them.
+
+Resting orders are tracked locally in the `orders` table; fills are reconciled
+each tick by polling order status via the CLOB client.
+"""
 
 from __future__ import annotations
 
+import time
+
 import structlog
 
-from polymarket_bot.execution.broker import Broker, Fill
-from polymarket_bot.persistence.repo import get_market
+from polymarket_bot.execution.broker import Broker
+from polymarket_bot.persistence.repo import (
+    Fill,
+    Order,
+    cancel_order_row,
+    insert_fill,
+    insert_order,
+    open_orders_by_market,
+    update_order_filled,
+)
 from polymarket_bot.polymarket.client import PolymarketClient
-from polymarket_bot.strategy.base import Bet
+from polymarket_bot.polymarket.markets import DiscoveredMarket
+from polymarket_bot.polymarket.quotes import Quote
+from polymarket_bot.strategy.base import PlaceLimit
 
 logger = structlog.get_logger()
 
 
-class LiveBroker(Broker):
-    """Submits real BUY orders for YES or NO tokens via the CLOB.
-
-    The runtime gate (`POLYMARKET_BOT_LIVE=1` + `--live`) is enforced in main.py;
-    by the time this broker is constructed, that gate has already passed.
-    """
-
+class LiveMMBroker(Broker):
     def __init__(self, client: PolymarketClient) -> None:
         self.client = client
 
-    def submit(self, bet: Bet) -> Fill:
-        market = get_market(bet.market_id)
-        if market is None:
-            return Fill(False, 0.0, 0.0, 0.0, 0.0, error="market not in DB")
-        token_id = market.yes_token_id if bet.side == "YES" else market.no_token_id
-        size = bet.stake / bet.entry_price if bet.entry_price > 0 else 0.0
-        if size <= 0:
-            return Fill(False, 0.0, 0.0, 0.0, 0.0, error="invalid size")
+    def place_limit(self, action: PlaceLimit, market: DiscoveredMarket, strategy: str) -> Order | None:
+        token_id = market.yes_token_id if action.token_side == "YES" else market.no_token_id
         result = self.client.place_order(
-            token_id=token_id, side="BUY", price=bet.entry_price, size=size,
+            token_id=token_id, side=action.side, price=action.price, size=action.size,
         )
-        if result is None:
-            return Fill(False, 0.0, 0.0, 0.0, 0.0, error="order rejected")
-        # CLOB fills are async — we record the order at the requested price.
-        # A follow-up reconciler can true-up actual fill prices from order history.
-        logger.info("live_order_accepted", market_id=bet.market_id[:12], side=bet.side,
-                    price=bet.entry_price, size=size, result=result)
-        return Fill(True, bet.entry_price, size, 0.0, 0.0)
+        if not result:
+            return None
+        order_id = str(result.get("orderID") or result.get("orderId") or result.get("id") or "")
+        if not order_id:
+            logger.warning("live_order_missing_id", result=result)
+            return None
+        order = Order(
+            order_id=order_id, client_order_id=action.client_order_id,
+            market_id=action.market_id, token_side=action.token_side, side=action.side,
+            price=action.price, size=action.size, filled=0.0, status="open",
+            placed_at=int(time.time()), ended_at=None, strategy=strategy,
+        )
+        insert_order(order)
+        return order
+
+    def cancel(self, order_id: str) -> bool:
+        try:
+            self.client.clob.cancel_order(order_id)
+        except Exception as exc:
+            logger.warning("live_cancel_failed", order_id=order_id[:18], error=str(exc)[:200])
+            return False
+        cancel_order_row(order_id)
+        return True
+
+    def reconcile_fills(self, market: DiscoveredMarket, quote: Quote) -> int:
+        n = 0
+        for o in open_orders_by_market(market.market_id):
+            try:
+                status = self.client.clob.get_order(o.order_id)
+            except Exception as exc:
+                logger.warning("live_status_fetch_failed", order_id=o.order_id[:18],
+                               error=str(exc)[:200])
+                continue
+            filled_size = float(status.get("size_matched", 0))
+            if filled_size <= o.filled:
+                continue
+            new_fill_size = filled_size - o.filled
+            avg_fill_price = float(status.get("price", o.price))
+            insert_fill(Fill(
+                id=None, order_id=o.order_id, market_id=o.market_id,
+                token_side=o.token_side, side=o.side,
+                price=avg_fill_price, size=new_fill_size,
+                fill_ts=int(time.time()), strategy=o.strategy,
+            ))
+            new_status = "filled" if filled_size >= o.size - 1e-9 else "open"
+            update_order_filled(o.order_id, filled=filled_size, status=new_status,
+                                ended_at=int(time.time()) if new_status == "filled" else None)
+            n += 1
+        return n
