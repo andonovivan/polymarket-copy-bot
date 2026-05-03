@@ -24,6 +24,9 @@ dev = [
 [project.scripts]
 polymarket-bot = "polymarket_bot.main:main"
 
+[tool.setuptools.package-data]
+polymarket_bot = ["dashboard/static/*", "dashboard/static/**/*"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -10,7 +11,7 @@ import structlog
 
 logger = structlog.get_logger()
 
-DEFAULT_DB_PATH = Path("bot_state.db")
+DEFAULT_DB_PATH = Path(os.getenv("BOT_DB_PATH", "bot_state.db"))
 
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None

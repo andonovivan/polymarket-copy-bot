@@ -56,12 +56,13 @@ def fetch_klines(start_ms: int | None = None, end_ms: int | None = None,
 def backfill(days: int = 60) -> int:
     """Backfill the local cache with the last `days` of 5-min bars.
 
-    Skips bars already present (the table is keyed on open_time).
-    Returns the number of new bars inserted.
+    Always starts from `now - days * 86400` so gaps in the cache get filled.
+    INSERT OR REPLACE makes refetching idempotent.
+    Returns the number of bars upserted.
     """
     now_s = int(time.time())
     start_s = now_s - days * 86400
-    cursor_ms = max(start_s, (latest_bar_time() or 0) + INTERVAL_SECONDS) * 1000
+    cursor_ms = start_s * 1000
     end_ms = now_s * 1000
 
     total = 0
