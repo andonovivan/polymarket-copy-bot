@@ -7,4 +7,4 @@ COPY src/ src/
 
 RUN pip install --no-cache-dir .
 
-CMD ["copy-bot"]
+CMD ["polymarket-bot", "run"]
