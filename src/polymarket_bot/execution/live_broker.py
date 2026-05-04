@@ -10,6 +10,7 @@ from polymarket_bot.execution.broker import Broker
 from polymarket_bot.persistence.repo import (
     Fill,
     Order,
+    append_equity,
     cancel_order_row,
     insert_fill,
     insert_order,
@@ -20,6 +21,25 @@ from polymarket_bot.polymarket.client import PolymarketClient
 from polymarket_bot.strategy.base import PlaceLimit, WeatherEvent
 
 logger = structlog.get_logger()
+
+
+def sync_wallet_balance(client: PolymarketClient) -> float | None:
+    """Read the wallet's USDC balance on Polymarket and append it to equity_curve.
+
+    The CLOB returns the trader's available collateral (USDC) in their proxy wallet.
+    In live mode this is the source of truth for bankroll; the local equity curve
+    is only an estimate until reconciled here.
+
+    Call once on startup and periodically (e.g. every 5 minutes) in live mode.
+    Returns the balance in USD, or None if the fetch failed.
+    """
+    balance = client.get_balance_usdc()
+    if balance is None:
+        logger.warning("wallet_balance_fetch_failed")
+        return None
+    append_equity(int(time.time()), float(balance))
+    logger.info("wallet_balance_synced", usdc=round(float(balance), 4))
+    return float(balance)
 
 
 class LiveBroker(Broker):

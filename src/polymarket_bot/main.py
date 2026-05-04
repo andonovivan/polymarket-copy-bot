@@ -41,6 +41,7 @@ from polymarket_bot.persistence.repo import (
     markets_with_unsettled_fills,
     open_orders_by_market,
     set_meta,
+    settlement_stats,
     upsert_market,
 )
 from polymarket_bot.persistence.schema import init_db
@@ -150,11 +151,82 @@ def _total_open_exposure_usd() -> float:
     return total
 
 
+def _repair_equity_curve(config: BotConfig) -> None:
+    """One-time cleanup for DBs from before the realized-cash fix.
+
+    Detect a polluted curve by checking whether any equity point exceeds
+    `realized_cash + max-possible-mtm-headroom`. If so, drop everything except
+    the earliest seed and append a fresh, correct MTM snapshot.
+    """
+    from polymarket_bot.persistence.schema import get_conn
+    conn = get_conn()
+    rows = conn.execute("SELECT ts, equity FROM equity_curve ORDER BY ts").fetchall()
+    if len(rows) <= 1:
+        return
+    realized = _realized_cash(config.starting_bankroll)
+    # Sanity ceiling: realized cash + total locked-in cost (worst-case unrealized).
+    cost_ceiling = sum(
+        inventory_for_market(mid)[0] * inventory_for_market(mid)[2]   # yes_shares × avg_cost
+        for mid in markets_with_unsettled_fills()
+    )
+    ceiling = realized + cost_ceiling + max(50.0, realized * 0.5)
+    if max(r[1] for r in rows) <= ceiling:
+        return
+    # Polluted — keep just the seed.
+    conn.execute("DELETE FROM equity_curve WHERE ts > ?", (rows[0][0],))
+    conn.commit()
+    logger.warning("equity_curve_repaired",
+                   removed=len(rows) - 1, kept_seed_ts=rows[0][0])
+
+
+def _realized_cash(starting_bankroll: float) -> float:
+    """Cash equity = starting bankroll + sum of all settled trade PnLs.
+
+    Computed from scratch each time so we never compound MTM samples into it.
+    """
+    s = settlement_stats()
+    return float(starting_bankroll) + float(s.get("pnl", 0.0))
+
+
+def _compute_mtm_equity(starting_bankroll: float) -> float:
+    """MTM equity = realized cash + sum(unrealized P&L of open positions)."""
+    from polymarket_bot.persistence.repo import get_market
+    unrealized = 0.0
+    for mid in markets_with_unsettled_fills():
+        yes, _, avg_yes, _ = inventory_for_market(mid)
+        if yes <= 0:
+            continue
+        m = get_market(mid)
+        cur = m.last_yes_mid if (m and m.last_yes_mid is not None) else None
+        if cur is None:
+            continue
+        unrealized += yes * (cur - avg_yes)
+    return _realized_cash(starting_bankroll) + unrealized
+
+
+_LAST_EQUITY_SAMPLE_TS = 0
+
+
+def _maybe_sample_equity(config: BotConfig) -> None:
+    """Append a periodic MTM-equity snapshot (throttled by config.equity_sample_seconds)."""
+    global _LAST_EQUITY_SAMPLE_TS
+    now = int(time.time())
+    if now - _LAST_EQUITY_SAMPLE_TS < config.equity_sample_seconds:
+        return
+    append_equity(now, _compute_mtm_equity(config.starting_bankroll))
+    _LAST_EQUITY_SAMPLE_TS = now
+
+
 def cmd_run(config: BotConfig, args: argparse.Namespace) -> None:
     init_db()
 
     if latest_equity() is None:
         append_equity(int(time.time()), config.starting_bankroll)
+
+    # If the equity curve was polluted by the previous double-count bug, repair
+    # it on startup: clear all but the initial seed and rewrite a fresh MTM
+    # snapshot. Idempotent; safe to leave permanently.
+    _repair_equity_curve(config)
 
     broker = _make_broker(config, args.live)
     StrategyClass = get_strategy_class(config.strategy)
@@ -232,15 +304,13 @@ def _tick(config: BotConfig, cities: list[str], broker: Broker, router: Router,
             broker.reconcile_fills(event)
 
     # Settle anything that's resolved on gamma since the last tick.
-    # Re-query open events that have ended (end_ts already in the past).
-    now = int(time.time())
-    settled_events = discover_open_events(cities, days_ahead=0)  # 0 includes today
-    # discover_open_events filters out events whose end_ts already passed.
-    # We need a direct "find events I've bet on that are past end_ts" query — use DB.
-    _settle_due_events(strategy.name)
+    _settle_due_events(strategy.name, winning_fee_bps=config.winning_fee_bps)
+
+    # Sample MTM equity into the curve so the chart populates between settlements.
+    _maybe_sample_equity(config)
 
 
-def _settle_due_events(strategy_name: str) -> None:
+def _settle_due_events(strategy_name: str, *, winning_fee_bps: int = 500) -> None:
     """Find DB markets whose resolution has passed and that we have fills on,
     group by event slug, ask gamma for the outcome, settle all buckets in one pass."""
     from polymarket_bot.persistence.schema import get_conn
@@ -275,7 +345,7 @@ def _settle_due_events(strategy_name: str) -> None:
             if ev is None:
                 logger.warning("settle_event_not_found", slug=ev_slug)
                 continue
-            settle_resolved_event(ev, strategy=strategy_name)
+            settle_resolved_event(ev, strategy=strategy_name, winning_fee_bps=winning_fee_bps)
 
 
 def main() -> None:

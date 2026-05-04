@@ -46,6 +46,16 @@ class BotConfig(BaseModel):
     lock_buffer_seconds: int = Field(default=600,
                                      description="Stop betting within N seconds of resolution")
 
+    # --- Fees ---
+    # Polymarket weather markets have feeSchedule.rate=0.05 (5%) on winnings, taker-only.
+    # We're always takers in v1 (BUY at ask), so we always pay this fee on winning shares.
+    winning_fee_bps: int = Field(default=500,
+                                 description="Fee in bps applied to winnings (1 - entry_price) per winning share")
+
+    # --- Equity sampling cadence ---
+    equity_sample_seconds: int = Field(default=60,
+                                       description="Append a MTM-equity snapshot every N seconds")
+
     # --- Bankroll ---
     starting_bankroll: float = Field(default=100.0)
 
@@ -81,6 +91,8 @@ class BotConfig(BaseModel):
             max_total_exposure_pct=float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.30")),
             min_market_depth_usd=float(os.getenv("MIN_MARKET_DEPTH_USD", "20")),
             lock_buffer_seconds=int(os.getenv("LOCK_BUFFER_SECONDS", "600")),
+            winning_fee_bps=int(os.getenv("WINNING_FEE_BPS", "500")),
+            equity_sample_seconds=int(os.getenv("EQUITY_SAMPLE_SECONDS", "60")),
             starting_bankroll=float(os.getenv("STARTING_BANKROLL", "100")),
             tick_seconds=int(os.getenv("TICK_SECONDS", "60")),
             dashboard_port=int(os.getenv("DASHBOARD_PORT", "8080")),

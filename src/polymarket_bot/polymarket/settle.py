@@ -13,11 +13,9 @@ import structlog
 
 from polymarket_bot.persistence.repo import (
     Settlement,
-    append_equity,
     fills_for_market,
     insert_settlement,
     inventory_for_market,
-    latest_equity,
     settle_market_row,
 )
 from polymarket_bot.polymarket.weather_markets import gamma_outcome
@@ -26,8 +24,15 @@ from polymarket_bot.strategy.base import WeatherEvent
 logger = structlog.get_logger()
 
 
-def settle_resolved_event(event: WeatherEvent, *, strategy: str) -> bool:
+def settle_resolved_event(  # noqa: D401 — clarity over brevity
+    event: WeatherEvent, *, strategy: str, winning_fee_bps: int = 500,
+) -> bool:
     """If `event` is resolved on gamma, write per-bucket Settlements + update equity.
+
+    Polymarket weather markets charge a fee on the **winnings** side at resolution
+    (taker-only, configurable via `winning_fee_bps`). Per gamma's feeSchedule the
+    rate is 5%; we apply it on the (payout − cost) winnings of each share, so a YES
+    bought at 0.10 that wins pays $1.00 − 0.05·0.90 = $0.955 net.
 
     Returns True if settlement happened, False if not yet resolved or already done.
     """
@@ -36,8 +41,8 @@ def settle_resolved_event(event: WeatherEvent, *, strategy: str) -> bool:
         return False
 
     now = int(time.time())
-    bankroll = latest_equity() or 0.0
     settled_any = False
+    fee_rate = max(0, winning_fee_bps) / 10_000.0
 
     for b in event.buckets:
         # Skip buckets we never touched.
@@ -53,10 +58,12 @@ def settle_resolved_event(event: WeatherEvent, *, strategy: str) -> bool:
         yes_shares, no_shares, avg_yes, avg_no = inventory_for_market(b.market_id)
         # We only ever BUY YES in WeatherForecast — yes_shares is the position;
         # no_shares should be 0. Guard the math anyway.
-        payout = (yes_shares if won else 0.0) + (0.0 if won else no_shares)
+        gross_payout = (yes_shares if won else 0.0) + (0.0 if won else no_shares)
         cost = avg_yes * yes_shares + avg_no * no_shares
+        winnings = max(0.0, gross_payout - cost) if won else 0.0
+        fee = winnings * fee_rate
+        payout = gross_payout - fee
         pnl = payout - cost
-        bankroll += pnl
         settled_any = True
 
         settle_market_row(b.market_id, outcome_label, 0.0, 0.0)
@@ -70,9 +77,10 @@ def settle_resolved_event(event: WeatherEvent, *, strategy: str) -> bool:
             "weather_bucket_settled",
             event_slug=event.slug, bucket=b.label, outcome=outcome_label,
             yes_shares=round(yes_shares, 2), avg_cost=round(avg_yes, 4),
+            gross_payout=round(gross_payout, 4), fee=round(fee, 4),
             payout=round(payout, 4), pnl=round(pnl, 4),
         )
 
-    if settled_any:
-        append_equity(now, bankroll)
+    # Equity curve is updated by main._maybe_sample_equity on the next tick,
+    # which recomputes realized cash from settlements (no double-counting).
     return settled_any
