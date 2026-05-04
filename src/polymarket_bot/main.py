@@ -229,6 +229,16 @@ def cmd_run(config: BotConfig, args: argparse.Namespace) -> None:
     _repair_equity_curve(config)
 
     broker = _make_broker(config, args.live)
+
+    # Live mode: read actual wallet USDC balance and use it as the live bankroll
+    # ground-truth. Falls back to config.starting_bankroll if the call fails.
+    live_client = None
+    if (config.mode == "live" or args.live) and config.private_key:
+        from polymarket_bot.execution.live_broker import sync_wallet_balance
+        live_client = PolymarketClient(config)
+        synced = sync_wallet_balance(live_client)
+        if synced is not None:
+            logger.info("live_bankroll_set", usdc=round(synced, 4))
     StrategyClass = get_strategy_class(config.strategy)
     strategy = StrategyClass()
     router = Router(broker, strategy.name)
@@ -252,11 +262,27 @@ def cmd_run(config: BotConfig, args: argparse.Namespace) -> None:
         tick_seconds=config.tick_seconds,
     )
 
+    last_wallet_sync = int(time.time())
+
     while _running:
+        # In live mode, halt the loop if a previous tick hit a HALT-class CLOB error.
+        from polymarket_bot.execution.live_broker import is_halted
+        if is_halted():
+            logger.error("bot_halted_due_to_clob_error",
+                         hint="auth/compliance failure — fix and restart")
+            break
+
         try:
             _tick(config, cities, broker, router, strategy)
         except Exception as exc:
             logger.error("tick_error", error=str(exc))
+
+        # Periodic live wallet reconciliation (every 5 min).
+        if live_client is not None and int(time.time()) - last_wallet_sync >= 300:
+            from polymarket_bot.execution.live_broker import sync_wallet_balance
+            sync_wallet_balance(live_client)
+            last_wallet_sync = int(time.time())
+
         set_meta("last_running_ts", str(int(time.time())))
         _interruptible_sleep(config.tick_seconds)
 
@@ -362,6 +388,9 @@ def main() -> None:
     p_run.add_argument("--live", action="store_true",
                        help="Place real orders (requires POLYMARKET_BOT_LIVE=1).")
 
+    sub.add_parser("redemptions",
+                   help="List winning YES positions that still need to be redeemed for USDC.")
+
     args = parser.parse_args()
     if not args.cmd:
         parser.print_help()
@@ -370,7 +399,21 @@ def main() -> None:
     config = BotConfig.from_env()
     configure_logging(config.log_level)
 
-    {"run": cmd_run}[args.cmd](config, args)
+    from polymarket_bot.polymarket.redeem import cmd_redemptions
+
+    DISPATCH = {
+        "run": cmd_run,
+        "redemptions": _wrap_with_init(cmd_redemptions),
+    }
+    DISPATCH[args.cmd](config, args)
+
+
+def _wrap_with_init(fn):
+    """Helper subcommands need init_db() but not the full bot startup."""
+    def wrapper(config, args):
+        init_db()
+        fn(config, args)
+    return wrapper
 
 
 if __name__ == "__main__":
