@@ -25,12 +25,16 @@
   }
 
   // setHTML only writes when the body changed — kills the visible flicker on
-  // tables that get a tick where nothing changed.
-  function setHTMLIfChanged(el, html, cacheKey) {
+  // tables that get a tick where nothing changed. The cache lives on the
+  // element itself (one slot per element, not per cacheKey) so navigating
+  // away and back forces a re-render even when the new content matches what
+  // a *different* renderer wrote previously to the same element. cacheKey is
+  // accepted for back-compat but ignored.
+  function setHTMLIfChanged(el, html, _cacheKey) {
     if (!el) return;
-    if (el.dataset[cacheKey] === html) return;
+    if (el.__lastHTML === html) return;
     el.innerHTML = html;
-    el.dataset[cacheKey] = html;
+    el.__lastHTML = html;
   }
 
   async function refreshHeader() {

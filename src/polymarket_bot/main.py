@@ -151,32 +151,52 @@ def _total_open_exposure_usd() -> float:
     return total
 
 
-def _repair_equity_curve(config: BotConfig) -> None:
-    """One-time cleanup for DBs from before the realized-cash fix.
+EQUITY_CURVE_VERSION = "2"
 
-    Detect a polluted curve by checking whether any equity point exceeds
-    `realized_cash + max-possible-mtm-headroom`. If so, drop everything except
-    the earliest seed and append a fresh, correct MTM snapshot.
+
+def _repair_equity_curve(config: BotConfig) -> None:
+    """Drop equity points that pre-date the current MTM-clamping logic.
+
+    Two triggers:
+      1) A version bump in EQUITY_CURVE_VERSION (forces a one-time reseed when
+         we change how MTM is computed).
+      2) Heuristic ceiling: realized + 2× current cost + a small floor. A
+         transient bad mid that sends one position 5× above its entry can blow
+         past 2× cost; once we see that we know the curve is contaminated.
     """
+    from polymarket_bot.persistence.repo import get_meta, set_meta
     from polymarket_bot.persistence.schema import get_conn
     conn = get_conn()
     rows = conn.execute("SELECT ts, equity FROM equity_curve ORDER BY ts").fetchall()
-    if len(rows) <= 1:
+    stored_version = get_meta("equity_curve_version")
+    version_bumped = stored_version != EQUITY_CURVE_VERSION
+
+    if len(rows) <= 1 and not version_bumped:
+        set_meta("equity_curve_version", EQUITY_CURVE_VERSION)
         return
+
     realized = _realized_cash(config.starting_bankroll)
-    # Sanity ceiling: realized cash + total locked-in cost (worst-case unrealized).
-    cost_ceiling = sum(
-        inventory_for_market(mid)[0] * inventory_for_market(mid)[2]   # yes_shares × avg_cost
+    cost = sum(
+        inventory_for_market(mid)[0] * inventory_for_market(mid)[2]
         for mid in markets_with_unsettled_fills()
     )
-    ceiling = realized + cost_ceiling + max(50.0, realized * 0.5)
-    if max(r[1] for r in rows) <= ceiling:
+    ceiling = realized + 2.0 * cost + 25.0
+    polluted = bool(rows) and max(r[1] for r in rows) > ceiling
+
+    if not (version_bumped or polluted):
         return
-    # Polluted — keep just the seed.
-    conn.execute("DELETE FROM equity_curve WHERE ts > ?", (rows[0][0],))
+
+    seed_ts = rows[0][0] if rows else int(time.time())
+    conn.execute("DELETE FROM equity_curve WHERE ts > ?", (seed_ts,))
     conn.commit()
-    logger.warning("equity_curve_repaired",
-                   removed=len(rows) - 1, kept_seed_ts=rows[0][0])
+    set_meta("equity_curve_version", EQUITY_CURVE_VERSION)
+    logger.warning(
+        "equity_curve_repaired",
+        removed=max(0, len(rows) - 1),
+        kept_seed_ts=seed_ts,
+        reason="version_bump" if version_bumped else "ceiling_breach",
+        ceiling=round(ceiling, 2),
+    )
 
 
 def _realized_cash(starting_bankroll: float) -> float:
@@ -189,7 +209,12 @@ def _realized_cash(starting_bankroll: float) -> float:
 
 
 def _compute_mtm_equity(starting_bankroll: float) -> float:
-    """MTM equity = realized cash + sum(unrealized P&L of open positions)."""
+    """MTM equity = realized cash + sum(unrealized P&L of open positions).
+
+    The mid is clamped to [0, 1] — a Polymarket binary share can never be
+    worth more than $1 or less than $0, so any out-of-range value is a bad
+    quote that would otherwise inject a phantom spike into the curve.
+    """
     from polymarket_bot.persistence.repo import get_market
     unrealized = 0.0
     for mid in markets_with_unsettled_fills():
@@ -200,6 +225,7 @@ def _compute_mtm_equity(starting_bankroll: float) -> float:
         cur = m.last_yes_mid if (m and m.last_yes_mid is not None) else None
         if cur is None:
             continue
+        cur = max(0.0, min(1.0, cur))
         unrealized += yes * (cur - avg_yes)
     return _realized_cash(starting_bankroll) + unrealized
 

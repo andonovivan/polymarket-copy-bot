@@ -27,14 +27,33 @@ class Quote:
 
 
 def parse_book(book: dict | None) -> tuple[float | None, float | None, float]:
-    """Return (best_bid, best_ask, ask_side_usd_depth) for one token's book."""
+    """Return (best_bid, best_ask, ask_side_usd_depth) for one token's book.
+
+    Side of the book that violates `0 < price < 1` is dropped (returned as None).
+    A crossed book (best_bid >= best_ask) drops both sides — we treat that as
+    no-quote rather than feed a glitch into MTM.
+    """
     if not book:
         return None, None, 0.0
     bids = book.get("bids") or []
     asks = book.get("asks") or []
     best_bid = float(bids[-1]["price"]) if bids else None
     best_ask = float(asks[-1]["price"]) if asks else None
-    ask_usd = sum(float(l["price"]) * float(l["size"]) for l in asks)
+    if best_bid is not None and not (0.0 < best_bid < 1.0):
+        best_bid = None
+    if best_ask is not None and not (0.0 < best_ask < 1.0):
+        best_ask = None
+    if best_bid is not None and best_ask is not None and best_bid >= best_ask:
+        best_bid = None
+        best_ask = None
+    ask_usd = 0.0
+    for l in asks:
+        try:
+            p = float(l["price"]); sz = float(l["size"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if 0.0 < p < 1.0 and sz > 0:
+            ask_usd += p * sz
     return best_bid, best_ask, ask_usd
 
 

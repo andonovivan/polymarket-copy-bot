@@ -63,7 +63,9 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
         inv_market_ids = sorted(unsettled | order_market_ids)
         inventories = []
         total_cost = 0.0
-        total_mtm = 0.0
+        priced_cost = 0.0       # only positions for which we have a current mid
+        priced_mtm = 0.0
+        unpriced_count = 0
         for mid in inv_market_ids:
             yes, no, avg_yes, avg_no = inventory_for_market(mid)
             if yes == 0 and no == 0:
@@ -77,7 +79,10 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
             unreal = (mtm - cost) if mtm is not None else None
             total_cost += cost
             if mtm is not None:
-                total_mtm += mtm
+                priced_cost += cost
+                priced_mtm += mtm
+            else:
+                unpriced_count += 1
             inventories.append({
                 "market_id": mid,
                 "title": title,
@@ -96,14 +101,20 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
             mm = get_market(o.market_id)
             d["title"] = mm.title if mm and mm.title else None
             order_dicts.append(d)
+        # PnL is computed only over positions we can actually mark; mixing unpriced
+        # cost into the denominator would silently bias PnL low by that cost.
+        unrealized = (priced_mtm - priced_cost) if priced_cost > 0 else None
         return 200, {
             "open_orders": order_dicts,
             "inventories": inventories,
             "count": len(orders) + len(inventories),
             "totals": {
                 "cost": total_cost,
-                "mtm_value": total_mtm,
-                "unrealized_pnl": (total_mtm - total_cost) if total_mtm > 0 else None,
+                "mtm_value": priced_mtm,
+                "priced_cost": priced_cost,
+                "unpriced_cost": total_cost - priced_cost,
+                "unpriced_positions": unpriced_count,
+                "unrealized_pnl": unrealized,
             },
         }
 
