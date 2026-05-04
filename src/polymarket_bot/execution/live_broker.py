@@ -1,8 +1,4 @@
-"""Live broker — places real CLOB limit orders and cancels them.
-
-Resting orders are tracked locally in the `orders` table; fills are reconciled
-each tick by polling order status via the CLOB client.
-"""
+"""Live broker — places real CLOB orders and polls fills."""
 
 from __future__ import annotations
 
@@ -21,21 +17,19 @@ from polymarket_bot.persistence.repo import (
     update_order_filled,
 )
 from polymarket_bot.polymarket.client import PolymarketClient
-from polymarket_bot.polymarket.markets import DiscoveredMarket
-from polymarket_bot.polymarket.quotes import Quote
-from polymarket_bot.strategy.base import PlaceLimit
+from polymarket_bot.strategy.base import PlaceLimit, WeatherEvent
 
 logger = structlog.get_logger()
 
 
-class LiveMMBroker(Broker):
+class LiveBroker(Broker):
     def __init__(self, client: PolymarketClient) -> None:
         self.client = client
 
-    def place_limit(self, action: PlaceLimit, market: DiscoveredMarket, strategy: str) -> Order | None:
-        token_id = market.yes_token_id if action.token_side == "YES" else market.no_token_id
+    def place_limit(self, action: PlaceLimit, strategy: str) -> Order | None:
         result = self.client.place_order(
-            token_id=token_id, side=action.side, price=action.price, size=action.size,
+            token_id=action.token_id, side=action.side,
+            price=action.price, size=action.size,
         )
         if not result:
             return None
@@ -61,28 +55,29 @@ class LiveMMBroker(Broker):
         cancel_order_row(order_id)
         return True
 
-    def reconcile_fills(self, market: DiscoveredMarket, quote: Quote) -> int:
+    def reconcile_fills(self, event: WeatherEvent) -> int:
         n = 0
-        for o in open_orders_by_market(market.market_id):
-            try:
-                status = self.client.clob.get_order(o.order_id)
-            except Exception as exc:
-                logger.warning("live_status_fetch_failed", order_id=o.order_id[:18],
-                               error=str(exc)[:200])
-                continue
-            filled_size = float(status.get("size_matched", 0))
-            if filled_size <= o.filled:
-                continue
-            new_fill_size = filled_size - o.filled
-            avg_fill_price = float(status.get("price", o.price))
-            insert_fill(Fill(
-                id=None, order_id=o.order_id, market_id=o.market_id,
-                token_side=o.token_side, side=o.side,
-                price=avg_fill_price, size=new_fill_size,
-                fill_ts=int(time.time()), strategy=o.strategy,
-            ))
-            new_status = "filled" if filled_size >= o.size - 1e-9 else "open"
-            update_order_filled(o.order_id, filled=filled_size, status=new_status,
-                                ended_at=int(time.time()) if new_status == "filled" else None)
-            n += 1
+        for b in event.buckets:
+            for o in open_orders_by_market(b.market_id):
+                try:
+                    status = self.client.clob.get_order(o.order_id)
+                except Exception as exc:
+                    logger.warning("live_status_fetch_failed", order_id=o.order_id[:18],
+                                   error=str(exc)[:200])
+                    continue
+                filled_size = float(status.get("size_matched", 0))
+                if filled_size <= o.filled:
+                    continue
+                new_size = filled_size - o.filled
+                avg_price = float(status.get("price", o.price))
+                insert_fill(Fill(
+                    id=None, order_id=o.order_id, market_id=o.market_id,
+                    token_side=o.token_side, side=o.side,
+                    price=avg_price, size=new_size,
+                    fill_ts=int(time.time()), strategy=o.strategy,
+                ))
+                new_status = "filled" if filled_size >= o.size - 1e-9 else "open"
+                update_order_filled(o.order_id, filled=filled_size, status=new_status,
+                                    ended_at=int(time.time()) if new_status == "filled" else None)
+                n += 1
         return n

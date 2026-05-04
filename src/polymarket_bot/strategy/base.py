@@ -1,73 +1,71 @@
-"""Market-making strategy interface and shared types.
+"""Betting-strategy interface + shared types.
 
-A strategy is a pure function of `MMState → list[OrderAction]`. The router/broker
-turns those actions into real or simulated orders on the Polymarket CLOB.
+A `BettingStrategy.evaluate(state) -> list[OrderAction]` is a pure function:
+state in, list of place/cancel actions out. The router/broker turns those into
+real or simulated orders on the Polymarket CLOB.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Union
-
-from polymarket_bot.polymarket.markets import DiscoveredMarket
-from polymarket_bot.polymarket.quotes import Quote
 
 
 # ---------------------------------------------------------------------------
-# Order actions — what a strategy emits each tick.
+# Order actions emitted by strategies.
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class PlaceLimit:
-    """Place a resting limit order on YES or NO at `price` for `size` shares.
-
-    `side` = BUY accumulates inventory; SELL reduces it (or short-sells against
-    collateral). For v1 we only BUY YES and BUY NO since binary MM is naturally
-    expressed as "accumulate balanced inventory; resolution clears it".
-    """
-    market_id: str
+    """Place a BUY/SELL limit order on a specific token (YES or NO)."""
+    market_id: str                       # Polymarket conditionId of the bucket
+    token_id: str                        # YES or NO token id (the side we're buying)
     token_side: Literal["YES", "NO"]
     side: Literal["BUY", "SELL"]
-    price: float                          # 0 < price < 1
-    size: float                           # shares
-    client_order_id: str                  # strategy-assigned id; broker echoes back
+    price: float                         # 0 < price < 1
+    size: float                          # shares
+    client_order_id: str                 # strategy-assigned id
 
 
 @dataclass
 class CancelOrder:
-    order_id: str                         # broker-assigned order id
+    order_id: str
 
 
 OrderAction = Union[PlaceLimit, CancelOrder]
 
 
 # ---------------------------------------------------------------------------
-# Inventory + open-order state visible to the strategy each tick.
+# Bucket / event state visible to a strategy.
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class Inventory:
-    """Net position per binary side, plus the average cost basis."""
-    yes_shares: float = 0.0
-    no_shares: float = 0.0
-    yes_cost_basis: float = 0.0           # avg $/share paid for held YES shares
-    no_cost_basis: float = 0.0
+class Bucket:
+    """One categorical sub-market of a weather event (e.g. '60-61°F')."""
+    label: str                           # e.g. "60-61°F"
+    market_id: str                       # Polymarket conditionId
+    yes_token_id: str
+    no_token_id: str
+    yes_bid: float | None
+    yes_ask: float | None                # what we'd pay to BUY YES
+    yes_mid: float | None
+    depth_yes_ask_usd: float             # ask-side liquidity we'd cross
+    model_p: float | None = None         # filled by the strategy ctx (None if no forecast)
 
-    @property
-    def is_balanced(self) -> bool:
-        return abs(self.yes_shares - self.no_shares) < 1e-6
 
-    @property
-    def imbalance(self) -> float:
-        """Signed: positive = more YES than NO (delta-long BTC up)."""
-        return self.yes_shares - self.no_shares
-
-    def mark_to_market(self, yes_mid: float) -> float:
-        """$ value of inventory at the given YES mid (NO mid = 1 − yes_mid)."""
-        return self.yes_shares * yes_mid + self.no_shares * (1.0 - yes_mid)
+@dataclass
+class WeatherEvent:
+    """A categorical weather market — a bundle of mutually-exclusive buckets."""
+    slug: str
+    title: str
+    city_key: str                        # registry key (e.g. "paris")
+    end_ts: int                          # market close
+    resolution_ts: int                   # when actual outcome finalizes (= end_ts)
+    unit: Literal["fahrenheit", "celsius"]
+    buckets: list[Bucket] = field(default_factory=list)
 
 
 @dataclass
@@ -79,24 +77,29 @@ class OpenOrder:
     side: Literal["BUY", "SELL"]
     price: float
     size: float
-    filled: float = 0.0                   # shares already filled
-    placed_at: int = 0                    # unix seconds
+    filled: float = 0.0
+    placed_at: int = 0
 
 
 @dataclass
-class MMState:
-    """Read-only snapshot the strategy gets each tick."""
-    market: DiscoveredMarket
-    quote: Quote
-    inventory: Inventory
-    open_orders: list[OpenOrder]
+class BetState:
+    """Read-only snapshot the strategy gets each tick for one event."""
+    event: WeatherEvent
     bankroll: float
     seconds_to_resolution: int
-    # Strategy parameters from BotConfig (carried in, not mutable):
-    base_spread: float
-    max_inventory_shares: float
-    inventory_skew: float
-    lock_buffer_seconds: int
+    # bucket label → list of our open orders on that bucket's YES token
+    open_orders_by_bucket: dict[str, list[OpenOrder]]
+    # bucket label → already-held YES shares (from prior fills, awaiting settlement)
+    held_yes_shares_by_bucket: dict[str, float]
+    # $ exposure already locked in across all events (cost basis of held YES shares)
+    total_open_exposure_usd: float
+    # Strategy parameters from BotConfig:
+    edge_threshold: float                # min |model_p - market_p| to bet
+    kelly_fraction: float                # fractional Kelly multiplier
+    max_bet_pct: float                   # hard cap as % of bankroll
+    max_total_exposure_pct: float        # cap on aggregate bankroll committed
+    min_market_depth_usd: float          # skip buckets thinner than this
+    lockout_seconds: int                 # don't bet within N seconds of resolution
 
 
 # ---------------------------------------------------------------------------
@@ -104,10 +107,10 @@ class MMState:
 # ---------------------------------------------------------------------------
 
 
-class MMStrategy(ABC):
-    """A market-making strategy: state in, list of actions out."""
+class BettingStrategy(ABC):
+    """Stateless: state in, actions out. One call per event per tick."""
 
     name: str = "abstract"
 
     @abstractmethod
-    def tick(self, state: MMState) -> list[OrderAction]: ...
+    def evaluate(self, state: BetState) -> list[OrderAction]: ...

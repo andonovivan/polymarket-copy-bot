@@ -1,21 +1,21 @@
-"""Name → MMStrategy class registry."""
+"""Name → BettingStrategy class registry."""
 
 from __future__ import annotations
 
-from polymarket_bot.strategy.base import MMStrategy
-from polymarket_bot.strategy.spread_only import SpreadOnlyMM
+from polymarket_bot.strategy.base import BettingStrategy
+from polymarket_bot.strategy.weather_forecast import WeatherForecastStrategy
 
-_REGISTRY: dict[str, type[MMStrategy]] = {
-    SpreadOnlyMM.name: SpreadOnlyMM,
+_REGISTRY: dict[str, type[BettingStrategy]] = {
+    WeatherForecastStrategy.name: WeatherForecastStrategy,
 }
 
 
-def register_strategy(cls: type[MMStrategy]) -> type[MMStrategy]:
+def register_strategy(cls: type[BettingStrategy]) -> type[BettingStrategy]:
     _REGISTRY[cls.name] = cls
     return cls
 
 
-def get_strategy_class(name: str) -> type[MMStrategy]:
+def get_strategy_class(name: str) -> type[BettingStrategy]:
     if name not in _REGISTRY:
         raise KeyError(f"unknown strategy: {name!r}. Known: {sorted(_REGISTRY)}")
     return _REGISTRY[name]

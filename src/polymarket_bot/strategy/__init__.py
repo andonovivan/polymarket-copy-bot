@@ -1,24 +1,25 @@
-"""Market-making strategy interface, types, and built-in strategies."""
+"""Betting strategies: interface, registry, built-ins."""
 
 from polymarket_bot.strategy.base import (
+    BetState,
+    BettingStrategy,
+    Bucket,
     CancelOrder,
-    Inventory,
-    MMState,
-    MMStrategy,
     OpenOrder,
     OrderAction,
     PlaceLimit,
+    WeatherEvent,
 )
 from polymarket_bot.strategy.registry import (
     get_strategy_class,
     list_strategies,
     register_strategy,
 )
-from polymarket_bot.strategy.spread_only import SpreadOnlyMM
+from polymarket_bot.strategy.weather_forecast import WeatherForecastStrategy
 
 __all__ = [
-    "MMStrategy", "MMState", "Inventory", "OpenOrder",
+    "BettingStrategy", "BetState", "Bucket", "WeatherEvent", "OpenOrder",
     "OrderAction", "PlaceLimit", "CancelOrder",
-    "SpreadOnlyMM",
-    "get_strategy_class", "list_strategies", "register_strategy",
+    "WeatherForecastStrategy",
+    "register_strategy", "get_strategy_class", "list_strategies",
 ]

@@ -1,0 +1,47 @@
+"""Bucket-probability + label-parsing logic in data/weather_feed."""
+
+from __future__ import annotations
+
+from polymarket_bot.data.weather_feed import bucket_probabilities, in_bucket
+
+
+def test_in_bucket_le_threshold():
+    assert in_bucket(53, "53°F or below") is True
+    assert in_bucket(40, "53°F or below") is True
+    assert in_bucket(54, "53°F or below") is False
+
+
+def test_in_bucket_ge_threshold():
+    assert in_bucket(72, "72°F or higher") is True
+    assert in_bucket(80, "72°F or higher") is True
+    assert in_bucket(71, "72°F or higher") is False
+
+
+def test_in_bucket_range_two_numbers():
+    assert in_bucket(58, "58-59°F") is True
+    assert in_bucket(59, "58-59°F") is True
+    assert in_bucket(60, "58-59°F") is False
+    assert in_bucket(57, "58-59°F") is False
+
+
+def test_in_bucket_single_number():
+    assert in_bucket(20, "20°C") is True
+    assert in_bucket(21, "20°C") is False
+    assert in_bucket(19, "20°C") is False
+
+
+def test_bucket_probabilities_partition():
+    members = [55, 56, 56, 58, 60, 60, 60, 62]
+    labels = ["54-55°F", "56-57°F", "58-59°F", "60-61°F", "62-63°F"]
+    p = bucket_probabilities(members, labels)
+    assert p["54-55°F"] == 1 / 8
+    assert p["56-57°F"] == 2 / 8
+    assert p["58-59°F"] == 1 / 8
+    assert p["60-61°F"] == 3 / 8
+    assert p["62-63°F"] == 1 / 8
+    assert abs(sum(p.values()) - 1.0) < 1e-9
+
+
+def test_bucket_probabilities_empty_members_returns_zeros():
+    p = bucket_probabilities([], ["20°C", "21°C"])
+    assert p == {"20°C": 0.0, "21°C": 0.0}

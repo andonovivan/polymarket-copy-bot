@@ -9,10 +9,12 @@ from polymarket_bot.config import BotConfig
 from polymarket_bot.persistence.repo import (
     all_open_orders,
     equity_curve,
+    get_market,
     inventory_for_market,
     latest_equity,
     list_fills,
     list_settlements,
+    markets_with_unsettled_fills,
     settlement_stats,
 )
 from polymarket_bot.strategy.registry import list_strategies
@@ -52,21 +54,57 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
         }
 
     if path == "/api/position":
-        # Aggregate inventory across all markets that have open orders or unsettled fills.
+        # Inventory comes from FILLS (held shares awaiting settlement); open
+        # orders are listed separately. Each inventory row is enriched with the
+        # latest observed YES price so the dashboard can show unrealized P&L.
         orders = all_open_orders()
-        markets = sorted({o.market_id for o in orders})
+        order_market_ids = {o.market_id for o in orders}
+        unsettled = set(markets_with_unsettled_fills())
+        inv_market_ids = sorted(unsettled | order_market_ids)
         inventories = []
-        for mid in markets:
+        total_cost = 0.0
+        total_mtm = 0.0
+        for mid in inv_market_ids:
             yes, no, avg_yes, avg_no = inventory_for_market(mid)
+            if yes == 0 and no == 0:
+                continue
+            m = get_market(mid)
+            title = (m.title if m and m.title else None)
+            current_yes = (m.last_yes_mid if m and m.last_yes_mid is not None else None)
+            quoted_at = (m.last_quote_ts if m else None)
+            cost = yes * avg_yes + no * avg_no
+            mtm = (yes * current_yes if current_yes is not None else None)
+            unreal = (mtm - cost) if mtm is not None else None
+            total_cost += cost
+            if mtm is not None:
+                total_mtm += mtm
             inventories.append({
                 "market_id": mid,
+                "title": title,
                 "yes_shares": yes, "no_shares": no,
                 "avg_yes_cost": avg_yes, "avg_no_cost": avg_no,
+                "current_yes_price": current_yes,
+                "current_yes_quoted_at": quoted_at,
+                "cost": cost,
+                "mtm_value": mtm,
+                "unrealized_pnl": unreal,
             })
+        # Annotate orders with their human title.
+        order_dicts = []
+        for o in orders:
+            d = _order_dict(o)
+            mm = get_market(o.market_id)
+            d["title"] = mm.title if mm and mm.title else None
+            order_dicts.append(d)
         return 200, {
-            "open_orders": [_order_dict(o) for o in orders],
+            "open_orders": order_dicts,
             "inventories": inventories,
-            "count": len(orders),
+            "count": len(orders) + len(inventories),
+            "totals": {
+                "cost": total_cost,
+                "mtm_value": total_mtm,
+                "unrealized_pnl": (total_mtm - total_cost) if total_mtm > 0 else None,
+            },
         }
 
     if path == "/api/equity-curve":
@@ -83,11 +121,25 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
 
     if path == "/api/fills":
         limit = int(qs.get("limit", ["20"])[0])
-        return 200, {"fills": [_fill_dict(f) for f in list_fills(limit=limit)]}
+        rows = list_fills(limit=limit)
+        out = []
+        for f in rows:
+            d = _fill_dict(f)
+            mm = get_market(f.market_id)
+            d["title"] = mm.title if mm and mm.title else None
+            out.append(d)
+        return 200, {"fills": out}
 
     if path == "/api/settlements":
         limit = int(qs.get("limit", ["50"])[0])
-        return 200, {"settlements": [_settlement_dict(s) for s in list_settlements(limit=limit)]}
+        rows = list_settlements(limit=limit)
+        out = []
+        for s in rows:
+            d = _settlement_dict(s)
+            mm = get_market(s.market_id)
+            d["title"] = mm.title if mm and mm.title else None
+            out.append(d)
+        return 200, {"settlements": out}
 
     if path == "/api/strategies":
         return 200, {

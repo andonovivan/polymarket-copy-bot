@@ -28,6 +28,11 @@ class Market:
     outcome: str | None = None
     bar_open: float | None = None
     bar_close: float | None = None
+    title: str | None = None
+    last_yes_bid: float | None = None
+    last_yes_ask: float | None = None
+    last_yes_mid: float | None = None
+    last_quote_ts: int | None = None
 
 
 @dataclass
@@ -80,14 +85,38 @@ class Settlement:
 
 
 def upsert_market(m: Market) -> None:
+    """Insert or update a market row, preserving cached quote columns when present."""
     conn = get_conn()
     with lock():
         conn.execute(
-            "INSERT OR REPLACE INTO markets "
-            "(market_id, slug, resolution_ts, yes_token_id, no_token_id, outcome, bar_open, bar_close, discovered_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT discovered_at FROM markets WHERE market_id=?), ?))",
-            (m.market_id, m.slug, m.resolution_ts, m.yes_token_id, m.no_token_id,
-             m.outcome, m.bar_open, m.bar_close, m.market_id, int(time.time())),
+            "INSERT INTO markets "
+            "(market_id, slug, title, resolution_ts, yes_token_id, no_token_id, "
+            " outcome, bar_open, bar_close, discovered_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(market_id) DO UPDATE SET "
+            "  slug=excluded.slug, "
+            "  title=COALESCE(excluded.title, markets.title), "
+            "  resolution_ts=excluded.resolution_ts, "
+            "  yes_token_id=excluded.yes_token_id, "
+            "  no_token_id=excluded.no_token_id, "
+            "  outcome=COALESCE(excluded.outcome, markets.outcome), "
+            "  bar_open=COALESCE(excluded.bar_open, markets.bar_open), "
+            "  bar_close=COALESCE(excluded.bar_close, markets.bar_close)",
+            (m.market_id, m.slug, m.title, m.resolution_ts, m.yes_token_id, m.no_token_id,
+             m.outcome, m.bar_open, m.bar_close, int(time.time())),
+        )
+        conn.commit()
+
+
+def update_market_quote(market_id: str, yes_bid: float | None, yes_ask: float | None) -> None:
+    """Cache the most recent YES bid/ask/mid for MTM display."""
+    yes_mid = ((yes_bid + yes_ask) / 2.0) if (yes_bid is not None and yes_ask is not None) else None
+    conn = get_conn()
+    with lock():
+        conn.execute(
+            "UPDATE markets SET last_yes_bid=?, last_yes_ask=?, last_yes_mid=?, last_quote_ts=? "
+            "WHERE market_id=?",
+            (yes_bid, yes_ask, yes_mid, int(time.time()), market_id),
         )
         conn.commit()
 
@@ -95,7 +124,8 @@ def upsert_market(m: Market) -> None:
 def get_market(market_id: str) -> Market | None:
     conn = get_conn()
     row = conn.execute(
-        "SELECT market_id, slug, resolution_ts, yes_token_id, no_token_id, outcome, bar_open, bar_close "
+        "SELECT market_id, slug, resolution_ts, yes_token_id, no_token_id, outcome, "
+        "bar_open, bar_close, title, last_yes_bid, last_yes_ask, last_yes_mid, last_quote_ts "
         "FROM markets WHERE market_id=?", (market_id,),
     ).fetchone()
     return Market(*row) if row else None
@@ -117,7 +147,8 @@ def unsettled_markets_due(now_ts: int) -> list[Market]:
     conn = get_conn()
     rows = conn.execute(
         "SELECT m.market_id, m.slug, m.resolution_ts, m.yes_token_id, m.no_token_id, "
-        "m.outcome, m.bar_open, m.bar_close "
+        "m.outcome, m.bar_open, m.bar_close, m.title, "
+        "m.last_yes_bid, m.last_yes_ask, m.last_yes_mid, m.last_quote_ts "
         "FROM markets m "
         "WHERE m.outcome IS NULL AND m.resolution_ts <= ? "
         "AND EXISTS (SELECT 1 FROM fills f WHERE f.market_id=m.market_id)",
@@ -225,6 +256,17 @@ def list_fills(limit: int = 100, offset: int = 0) -> list[Fill]:
 # ---------------------------------------------------------------------------
 # Inventory & PnL (computed from fills)
 # ---------------------------------------------------------------------------
+
+
+def markets_with_unsettled_fills() -> list[str]:
+    """All market_ids that have at least one fill and no Settlement row yet."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT f.market_id FROM fills f "
+        "WHERE NOT EXISTS (SELECT 1 FROM settlements s WHERE s.market_id = f.market_id) "
+        "ORDER BY f.market_id"
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 def inventory_for_market(market_id: str) -> tuple[float, float, float, float]:

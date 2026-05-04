@@ -1,18 +1,14 @@
-"""Settle MM markets: when a Polymarket BTC up/down 5m market resolves,
-fold the inventory we accumulated into a $/share payout, append PnL to
-the equity curve, and write a Settlement row.
+"""Settle a resolved weather event into per-bucket Settlement rows + equity update.
 
-Outcome source: we re-fetch the event from gamma to read `outcomePrices`.
-That's authoritative — it's exactly what Polymarket pays. We log a
-warning when it diverges from a Binance-bar-derived UP/DOWN guess (Polymarket
-settles via Chainlink BTC/USD, so divergences happen near the boundary).
+Outcomes come from gamma's `outcomePrices` per sub-market: [1, 0] for the
+winning bucket, [0, 1] for losers. For each bucket we hold YES tokens on, the
+payout is (1 if won else 0) per share.
 """
 
 from __future__ import annotations
 
 import time
 
-import httpx
 import structlog
 
 from polymarket_bot.persistence.repo import (
@@ -24,68 +20,59 @@ from polymarket_bot.persistence.repo import (
     latest_equity,
     settle_market_row,
 )
-from polymarket_bot.polymarket.markets import GAMMA_API_URL, DiscoveredMarket
+from polymarket_bot.polymarket.weather_markets import gamma_outcome
+from polymarket_bot.strategy.base import WeatherEvent
 
 logger = structlog.get_logger()
 
 
-def _outcome_from_gamma(market: DiscoveredMarket) -> str | None:
-    """UP/DOWN if the gamma event is resolved, else None."""
-    try:
-        with httpx.Client(timeout=10.0) as c:
-            resp = c.get(f"{GAMMA_API_URL}/events", params={"slug": market.slug})
-            resp.raise_for_status()
-            events = resp.json()
-            if not events:
-                return None
-            m = events[0].get("markets") or []
-            if not m:
-                return None
-            prices = m[0].get("outcomePrices")
-            if isinstance(prices, str):
-                import json as _json
-                prices = _json.loads(prices)
-            if not prices or len(prices) < 2:
-                return None
-            return "UP" if float(prices[0]) > float(prices[1]) else "DOWN"
-    except Exception as exc:
-        logger.warning("gamma_outcome_fetch_failed", slug=market.slug, error=str(exc)[:200])
-        return None
+def settle_resolved_event(event: WeatherEvent, *, strategy: str) -> bool:
+    """If `event` is resolved on gamma, write per-bucket Settlements + update equity.
 
-
-def settle_resolved_market(
-    market: DiscoveredMarket, *, strategy: str, bankroll_at_settle: float | None = None,
-) -> bool:
-    """Resolve `market`, compute PnL from our fills, append equity. Returns True if settled."""
-    outcome = _outcome_from_gamma(market)
-    if outcome is None:
+    Returns True if settlement happened, False if not yet resolved or already done.
+    """
+    outcomes = gamma_outcome(event)
+    if outcomes is None:
         return False
 
-    fills = fills_for_market(market.market_id)
-    if not fills:
-        # Nothing to settle — still mark the market resolved.
-        settle_market_row(market.market_id, outcome, 0.0, 0.0)
-        return True
-
-    yes_shares, no_shares, avg_yes, avg_no = inventory_for_market(market.market_id)
-    payout = (yes_shares if outcome == "UP" else 0.0) + (no_shares if outcome == "DOWN" else 0.0)
-    cost = avg_yes * yes_shares + avg_no * no_shares
-    pnl = payout - cost
     now = int(time.time())
+    bankroll = latest_equity() or 0.0
+    settled_any = False
 
-    settle_market_row(market.market_id, outcome, 0.0, 0.0)
-    insert_settlement(Settlement(
-        market_id=market.market_id, settled_at=now, outcome=outcome,
-        yes_shares=yes_shares, no_shares=no_shares,
-        avg_yes_cost=avg_yes, avg_no_cost=avg_no,
-        payout=payout, cost=cost, pnl=pnl, strategy=strategy,
-    ))
-    bankroll = bankroll_at_settle if bankroll_at_settle is not None else (latest_equity() or 0.0)
-    append_equity(now, bankroll + pnl)
-    logger.info(
-        "market_settled",
-        market_id=market.market_id[:12], outcome=outcome,
-        yes=round(yes_shares, 2), no=round(no_shares, 2),
-        payout=round(payout, 4), cost=round(cost, 4), pnl=round(pnl, 4),
-    )
-    return True
+    for b in event.buckets:
+        # Skip buckets we never touched.
+        fills = fills_for_market(b.market_id)
+        if not fills:
+            settle_market_row(b.market_id, "WIN" if outcomes.get(b.label, 0) >= 0.5 else "LOSS",
+                              0.0, 0.0)
+            continue
+
+        won = outcomes.get(b.label, 0) >= 0.5
+        outcome_label = "WIN" if won else "LOSS"
+
+        yes_shares, no_shares, avg_yes, avg_no = inventory_for_market(b.market_id)
+        # We only ever BUY YES in WeatherForecast — yes_shares is the position;
+        # no_shares should be 0. Guard the math anyway.
+        payout = (yes_shares if won else 0.0) + (0.0 if won else no_shares)
+        cost = avg_yes * yes_shares + avg_no * no_shares
+        pnl = payout - cost
+        bankroll += pnl
+        settled_any = True
+
+        settle_market_row(b.market_id, outcome_label, 0.0, 0.0)
+        insert_settlement(Settlement(
+            market_id=b.market_id, settled_at=now, outcome=outcome_label,
+            yes_shares=yes_shares, no_shares=no_shares,
+            avg_yes_cost=avg_yes, avg_no_cost=avg_no,
+            payout=payout, cost=cost, pnl=pnl, strategy=strategy,
+        ))
+        logger.info(
+            "weather_bucket_settled",
+            event_slug=event.slug, bucket=b.label, outcome=outcome_label,
+            yes_shares=round(yes_shares, 2), avg_cost=round(avg_yes, 4),
+            payout=round(payout, 4), pnl=round(pnl, 4),
+        )
+
+    if settled_any:
+        append_equity(now, bankroll)
+    return settled_any

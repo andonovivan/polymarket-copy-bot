@@ -25,13 +25,18 @@ SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS markets (
     market_id      TEXT PRIMARY KEY,
     slug           TEXT NOT NULL,
+    title          TEXT,                           -- human-readable, e.g. "Paris · May 4 · 16°C"
     resolution_ts  INTEGER NOT NULL,
     yes_token_id   TEXT NOT NULL,
     no_token_id    TEXT NOT NULL,
     outcome        TEXT,
     bar_open       REAL,
     bar_close      REAL,
-    discovered_at  INTEGER NOT NULL
+    discovered_at  INTEGER NOT NULL,
+    last_yes_bid   REAL,                           -- most recent observed YES bid
+    last_yes_ask   REAL,                           -- most recent observed YES ask
+    last_yes_mid   REAL,                           -- (last_yes_bid + last_yes_ask) / 2
+    last_quote_ts  INTEGER                         -- when last_* were sampled
 );
 CREATE INDEX IF NOT EXISTS idx_markets_resolution ON markets(resolution_ts);
 
@@ -105,12 +110,29 @@ _LEGACY_TABLES = [
 ]
 
 
+_MARKETS_NEW_COLUMNS = [
+    ("title", "TEXT"),
+    ("last_yes_bid", "REAL"),
+    ("last_yes_ask", "REAL"),
+    ("last_yes_mid", "REAL"),
+    ("last_quote_ts", "INTEGER"),
+]
+
+
 def _drop_legacy(conn: sqlite3.Connection) -> None:
     for t in _LEGACY_TABLES:
         try:
             conn.execute(f"DROP TABLE IF EXISTS {t}")
         except Exception as exc:
             logger.warning("legacy_drop_failed", table=t, error=str(exc))
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Forward-only ALTER TABLE migrations."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(markets)")}
+    for col, type_ in _MARKETS_NEW_COLUMNS:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE markets ADD COLUMN {col} {type_}")
 
 
 def get_conn(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -124,6 +146,7 @@ def get_conn(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _conn.execute("PRAGMA foreign_keys=ON")
     _drop_legacy(_conn)
     _conn.executescript(SCHEMA_DDL)
+    _migrate(_conn)
     _conn.commit()
     return _conn
 

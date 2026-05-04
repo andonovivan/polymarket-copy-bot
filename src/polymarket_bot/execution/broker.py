@@ -1,8 +1,7 @@
-"""Broker interface for market-making.
+"""Broker interface — place / cancel limit orders, reconcile fills.
 
-Two implementations: PaperMMBroker (simulates fills against the live book) and
-LiveMMBroker (calls the Polymarket CLOB). Both share the same shape so the
-strategy + router code is mode-agnostic.
+Two implementations: PaperBroker (simulates fills against the live book) and
+LiveBroker (CLOB API). Same shape so the router/strategy is mode-agnostic.
 """
 
 from __future__ import annotations
@@ -10,21 +9,16 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 from polymarket_bot.persistence.repo import Order
-from polymarket_bot.polymarket.markets import DiscoveredMarket
-from polymarket_bot.polymarket.quotes import Quote
-from polymarket_bot.strategy.base import PlaceLimit
+from polymarket_bot.strategy.base import PlaceLimit, WeatherEvent
 
 
 class Broker(ABC):
-    """Place and cancel resting limit orders. Must persist to the orders table."""
-
     @abstractmethod
-    def place_limit(self, action: PlaceLimit, market: DiscoveredMarket, strategy: str) -> Order | None:
-        """Place a single limit order. Returns the persisted Order on success."""
+    def place_limit(self, action: PlaceLimit, strategy: str) -> Order | None: ...
 
     @abstractmethod
     def cancel(self, order_id: str) -> bool: ...
 
     @abstractmethod
-    def reconcile_fills(self, market: DiscoveredMarket, quote: Quote) -> int:
-        """Detect fills since the last call and persist them. Returns # of new fills."""
+    def reconcile_fills(self, event: WeatherEvent) -> int:
+        """Detect fills since last call (per-bucket book check). Returns # of new fills."""
