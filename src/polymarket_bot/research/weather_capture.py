@@ -1,13 +1,23 @@
-"""Path B: live capture of (model_p, market_p, outcome) for candidate cities.
+"""Path B: live capture of (model_p, model_day_max_mean, market_p, outcome).
 
-Read-only — never places orders. Each tick, for cities NOT already in the
-production CITY_REGISTRY, snapshots model probabilities and market quotes
+Read-only — never places orders. Each tick, for every city the bot knows
+about (production CITY_REGISTRY + candidate list), snapshots:
+
+  * `model_p`              — bucket probability from the live ensemble
+  * `model_day_max_mean`   — ensemble mean day-max (for bias correction)
+  * `market_yes_mid/bid/ask` — current order-book snapshot
+
 into `weather_research_obs`. After each event resolves, `update_outcomes()`
 fills in the won/lost flag.
 
-The accumulated dataset is the ground truth for promoting cities into
-CITY_REGISTRY: same model, same data sources, same closing-price methodology
-as live trading — no leakage, no API mismatch with the backtest harness.
+The accumulated dataset serves two purposes:
+
+  1. **City promotion** — same model, same data sources, same methodology
+     as live trading; no leakage. Use to confirm Path A's directional
+     signal before promoting a city to CITY_REGISTRY.
+  2. **Strategy calibration** — `strategy/calibration.py` reads back from
+     this table to compute per-city bias corrections (#1) and isotonic
+     probability calibrators (#2).
 """
 
 from __future__ import annotations
@@ -31,30 +41,40 @@ from polymarket_bot.polymarket.weather_markets import (
 logger = structlog.get_logger()
 
 
-_CANDIDATE_REGISTRY: dict[str, City] = {}
+_CAPTURE_REGISTRY: dict[str, City] = {}
 
 
-def _candidate_registry() -> dict[str, City]:
-    """Lazily build a City entry for each non-CITY_REGISTRY candidate."""
-    if _CANDIDATE_REGISTRY:
-        return _CANDIDATE_REGISTRY
+def _capture_registry() -> dict[str, City]:
+    """Cities to capture: production CITY_REGISTRY + lazily-geocoded candidates.
+
+    Capturing production cities feeds the calibration layer with the SAME
+    model that's actively trading, so per-city bias and isotonic calibration
+    are derived from real production data — not a 3-model historical proxy.
+    """
+    if _CAPTURE_REGISTRY:
+        return _CAPTURE_REGISTRY
+    # Production cities — already have geocoded entries with airport coords.
+    for key, city in CITY_REGISTRY.items():
+        _CAPTURE_REGISTRY[key] = city
+    # Candidate cities — geocode lazily, default to celsius (Path B's
+    # detect-on-event override below adapts if a market shows up in °F).
     for slug in CANDIDATES:
-        if slug in CITY_REGISTRY:
+        if slug in _CAPTURE_REGISTRY:
             continue
         geo = geocode(slug)
         if geo is None:
             logger.warning("research_geocode_failed", city=slug)
             continue
-        _CANDIDATE_REGISTRY[slug] = City(
+        _CAPTURE_REGISTRY[slug] = City(
             key=slug, lat=geo.lat, lon=geo.lon, tz=geo.tz,
             unit="celsius",
             event_slug_prefix=f"highest-temperature-in-{slug}-on-",
         )
-    if _CANDIDATE_REGISTRY:
-        logger.info("research_candidates_loaded",
-                    count=len(_CANDIDATE_REGISTRY),
-                    cities=sorted(_CANDIDATE_REGISTRY.keys()))
-    return _CANDIDATE_REGISTRY
+    if _CAPTURE_REGISTRY:
+        logger.info("research_registry_loaded",
+                    count=len(_CAPTURE_REGISTRY),
+                    cities=sorted(_CAPTURE_REGISTRY.keys()))
+    return _CAPTURE_REGISTRY
 
 
 def _recent_obs_exists(city_key: str, slug: str, bucket_label: str,
@@ -72,17 +92,19 @@ def _recent_obs_exists(city_key: str, slug: str, bucket_label: str,
 
 
 def _record_obs(city_key: str, target_date: str, slug: str, bucket_label: str,
-                model_p: float, mid: float | None, bid: float | None,
+                model_p: float, model_day_max_mean: float | None,
+                mid: float | None, bid: float | None,
                 ask: float | None) -> None:
     conn = get_conn()
     with lock():
         conn.execute(
             "INSERT INTO weather_research_obs "
             "(city_key, target_date, slug, bucket_label, model_p, "
-            " market_yes_mid, market_yes_bid, market_yes_ask, observed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " model_day_max_mean, market_yes_mid, market_yes_bid, "
+            " market_yes_ask, observed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (city_key, target_date, slug, bucket_label, model_p,
-             mid, bid, ask, int(time.time())),
+             model_day_max_mean, mid, bid, ask, int(time.time())),
         )
         conn.commit()
 
@@ -108,7 +130,7 @@ def capture_observations(*, window_seconds: int = 3600,
 
     Returns the number of new obs rows written.
     """
-    registry = _candidate_registry()
+    registry = _capture_registry()
     if not registry:
         return 0
     now = int(datetime.now(timezone.utc).timestamp())
@@ -150,12 +172,14 @@ def capture_observations(*, window_seconds: int = 3600,
                     continue
                 labels = [b.label for b in ev.buckets]
                 probs = bucket_probabilities(forecast.members, labels)
+                day_max_mean = (sum(forecast.members) / len(forecast.members)
+                                if forecast.members else None)
                 for b in ev.buckets:
                     if _recent_obs_exists(ck, ev.slug, b.label, dedupe_seconds):
                         continue
                     _record_obs(
                         ck, target_date, ev.slug, b.label,
-                        probs.get(b.label, 0.0),
+                        probs.get(b.label, 0.0), day_max_mean,
                         b.yes_mid, b.yes_bid, b.yes_ask,
                     )
                     n_written += 1

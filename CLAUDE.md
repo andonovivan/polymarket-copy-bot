@@ -165,28 +165,64 @@ table of `brier_model`, `brier_market`, `bets`, `pnl`.
 [`src/polymarket_bot/research/weather_capture.py`](src/polymarket_bot/research/weather_capture.py).
 
 Read-only — never places orders. Off by default; enable with
-`RESEARCH_ENABLED=1`. When enabled, each tick:
+`RESEARCH_ENABLED=1` (production deployment sets this in
+[`docker-compose.yml`](docker-compose.yml)). When enabled, each tick:
 
-1. Lazily geocodes the candidate city set (everything in
-   `CANDIDATES` from `weather_city_eval.py` minus `CITY_REGISTRY`).
-2. Discovers their open events; filters to those settling within
-   `RESEARCH_WINDOW_SECONDS` (default 1h).
-3. Snapshots `(model_p, yes_mid, yes_bid, yes_ask)` per bucket into the
-   `weather_research_obs` table.
+1. Builds a capture registry of **production cities + candidate cities**.
+   Production entries reuse `CITY_REGISTRY` directly; candidates are
+   geocoded lazily via Open-Meteo.
+2. Pre-filters slugs by expected end-date so we only gamma-fetch events
+   plausibly settling within `RESEARCH_WINDOW_SECONDS` (default 1h, ±1d
+   margin to absorb timezone quirks).
+3. Snapshots `(model_p, model_day_max_mean, yes_mid, yes_bid, yes_ask)`
+   per bucket into the `weather_research_obs` table.
 4. Dedupes within `RESEARCH_DEDUPE_SECONDS` (default 10 min) per
    (city, slug, bucket).
-5. Backfills `outcome` after settlement via the gamma API.
+5. Backfills `outcome` after settlement via the gamma API; gives up on
+   events older than `UNRESOLVED_GIVE_UP_DAYS` (30) so cancelled markets
+   don't generate forever-retries.
 
-Path B is the **ground-truth dataset** for promoting cities — same model,
-same data sources, same closing-price methodology as live trading. No
-historical-API leakage. The intent is to let it accumulate ~30 days, then
-re-rank candidates from this table directly.
+Path B serves two purposes:
+
+- **City promotion** — same model, same data sources, same methodology
+  as live trading. Use to confirm Path A's directional signal before
+  promoting a city to `CITY_REGISTRY`.
+- **Strategy calibration** — the calibration layer (below) reads back
+  from this table to compute per-city bias and probability calibrators.
 
 Schema:
 [`weather_research_obs`](src/polymarket_bot/persistence/schema.py) —
-`(city_key, target_date, slug, bucket_label, model_p, market_yes_mid/bid/ask,
-observed_at, outcome, settled_at)`. Indexed for the obs-lookup and
-unsettled-rows-per-day queries.
+`(city_key, target_date, slug, bucket_label, model_p, model_day_max_mean,
+market_yes_mid/bid/ask, observed_at, outcome, settled_at)`. Indexed for
+the obs-lookup and unsettled-rows-per-day queries.
+
+## Strategy calibration
+
+[`src/polymarket_bot/strategy/calibration.py`](src/polymarket_bot/strategy/calibration.py).
+
+Two layers stacked on top of the raw ensemble inside
+`_attach_model_probabilities`. Both are **pass-through (no-op) until enough
+Path B data accumulates**, so the bot keeps trading the raw ensemble in the
+meantime and the corrections kick in automatically once data is present.
+
+**Layer 1 — per-city bias correction.** For each settled event we have
+`model_day_max_mean` (ensemble mean) and the winning bucket's midpoint
+(actual day-max with bucket-resolution noise). The bias is the median of
+`(model − actual)` over the last 30 days (≥10 events required); we shift
+each ensemble member by `-bias` before bucketing. Catches systematic
+forecast biases that Open-Meteo grids sometimes have over particular
+cities (urban heat island, station siting, etc.).
+
+**Layer 2 — isotonic probability calibration.** Counting-style ensemble
+probabilities are usually under-dispersive (overconfident on the modal
+bucket). We fit an `IsotonicRegression(model_p, won)` per city over the
+last 30 days of bucket-level observations (≥110 obs required) and run
+each bucket's probability through the fitted curve. Standard ML
+calibration trick; reduces log-loss meaningfully when the raw model is
+miscalibrated.
+
+Both fits are cached in-process for `CACHE_TTL_SECONDS` (1h). The
+in-memory caches reset on bot restart, then re-fit lazily on first use.
 
 ## Dashboard
 

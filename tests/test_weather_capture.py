@@ -35,6 +35,7 @@ def test_record_obs_then_recent_exists_within_window(tmp_db):
         slug="highest-temperature-in-taipei-on-may-10-2026",
         bucket_label="22°C",
         model_p=0.4,
+        model_day_max_mean=22.5,
         mid=0.35, bid=0.34, ask=0.36,
     )
     assert _recent_obs_exists(
@@ -72,6 +73,7 @@ def test_record_obs_handles_null_market_quotes(tmp_db):
         slug="slug-h",
         bucket_label="15°C",
         model_p=0.3,
+        model_day_max_mean=None,
         mid=None, bid=None, ask=None,
     )
     conn = get_conn()

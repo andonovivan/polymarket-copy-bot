@@ -102,7 +102,21 @@ def _persist_event(event: WeatherEvent) -> None:
 
 
 def _attach_model_probabilities(event: WeatherEvent) -> int:
-    """Fetch the ensemble forecast for this event's date and fill bucket.model_p."""
+    """Fetch the ensemble forecast for this event's date and fill bucket.model_p.
+
+    Two calibration layers are applied (each is a no-op until enough Path B
+    data accumulates — see strategy/calibration.py):
+
+      1. **Bias correction** — shift members by the historical median
+         (model − actual) so the bucketing reflects the city's known offset.
+      2. **Isotonic calibration** — map raw bucket probabilities through a
+         fitted `model_p → observed_freq` curve, fixing under-/over-dispersion.
+    """
+    from polymarket_bot.strategy.calibration import (
+        apply_bias_correction, apply_calibration,
+        get_city_bias, get_city_calibrator,
+    )
+
     city = CITY_REGISTRY.get(event.city_key)
     if city is None:
         return 0
@@ -112,8 +126,12 @@ def _attach_model_probabilities(event: WeatherEvent) -> int:
     forecast = get_ensemble(city, target_date)
     if forecast is None or not forecast.members:
         return 0
+    bias = get_city_bias(event.city_key)
+    members = apply_bias_correction(forecast.members, bias)
     labels = [b.label for b in event.buckets]
-    probs = bucket_probabilities(forecast.members, labels)
+    probs = bucket_probabilities(members, labels)
+    calibrator = get_city_calibrator(event.city_key)
+    probs = apply_calibration(probs, calibrator)
     for b in event.buckets:
         b.model_p = probs.get(b.label, 0.0)
     return len(forecast.members)

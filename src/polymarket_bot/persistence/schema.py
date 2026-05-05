@@ -101,18 +101,19 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 CREATE TABLE IF NOT EXISTS weather_research_obs (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    city_key        TEXT NOT NULL,
-    target_date     TEXT NOT NULL,                  -- YYYY-MM-DD in city tz
-    slug            TEXT NOT NULL,
-    bucket_label    TEXT NOT NULL,
-    model_p         REAL NOT NULL,
-    market_yes_mid  REAL,
-    market_yes_bid  REAL,
-    market_yes_ask  REAL,
-    observed_at     INTEGER NOT NULL,
-    outcome         INTEGER,                         -- 1 won, 0 lost, NULL until settled
-    settled_at      INTEGER
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    city_key            TEXT NOT NULL,
+    target_date         TEXT NOT NULL,                  -- YYYY-MM-DD in city tz
+    slug                TEXT NOT NULL,
+    bucket_label        TEXT NOT NULL,
+    model_p             REAL NOT NULL,
+    model_day_max_mean  REAL,                           -- ensemble mean day-max (°C or °F)
+    market_yes_mid      REAL,
+    market_yes_bid      REAL,
+    market_yes_ask      REAL,
+    observed_at         INTEGER NOT NULL,
+    outcome             INTEGER,                        -- 1 won, 0 lost, NULL until settled
+    settled_at          INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_research_obs_lookup
     ON weather_research_obs(city_key, slug, bucket_label, observed_at);
@@ -137,6 +138,10 @@ _MARKETS_NEW_COLUMNS = [
     ("last_quote_ts", "INTEGER"),
 ]
 
+_RESEARCH_OBS_NEW_COLUMNS = [
+    ("model_day_max_mean", "REAL"),
+]
+
 
 def _drop_legacy(conn: sqlite3.Connection) -> None:
     for t in _LEGACY_TABLES:
@@ -148,10 +153,14 @@ def _drop_legacy(conn: sqlite3.Connection) -> None:
 
 def _migrate(conn: sqlite3.Connection) -> None:
     """Forward-only ALTER TABLE migrations."""
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(markets)")}
+    market_cols = {row[1] for row in conn.execute("PRAGMA table_info(markets)")}
     for col, type_ in _MARKETS_NEW_COLUMNS:
-        if col not in cols:
+        if col not in market_cols:
             conn.execute(f"ALTER TABLE markets ADD COLUMN {col} {type_}")
+    obs_cols = {row[1] for row in conn.execute("PRAGMA table_info(weather_research_obs)")}
+    for col, type_ in _RESEARCH_OBS_NEW_COLUMNS:
+        if col not in obs_cols:
+            conn.execute(f"ALTER TABLE weather_research_obs ADD COLUMN {col} {type_}")
 
 
 def get_conn(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
