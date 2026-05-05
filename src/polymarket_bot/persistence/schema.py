@@ -99,6 +99,25 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS weather_research_obs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    city_key        TEXT NOT NULL,
+    target_date     TEXT NOT NULL,                  -- YYYY-MM-DD in city tz
+    slug            TEXT NOT NULL,
+    bucket_label    TEXT NOT NULL,
+    model_p         REAL NOT NULL,
+    market_yes_mid  REAL,
+    market_yes_bid  REAL,
+    market_yes_ask  REAL,
+    observed_at     INTEGER NOT NULL,
+    outcome         INTEGER,                         -- 1 won, 0 lost, NULL until settled
+    settled_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_research_obs_lookup
+    ON weather_research_obs(city_key, slug, bucket_label, observed_at);
+CREATE INDEX IF NOT EXISTS idx_research_obs_unsettled
+    ON weather_research_obs(target_date) WHERE outcome IS NULL;
 """
 
 

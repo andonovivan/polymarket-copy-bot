@@ -358,6 +358,21 @@ def _tick(config: BotConfig, cities: list[str], broker: Broker, router: Router,
     # Settle anything that's resolved on gamma since the last tick.
     _settle_due_events(strategy.name, winning_fee_bps=config.winning_fee_bps)
 
+    # Read-only research capture for candidate cities (Path B).
+    if config.research_enabled:
+        try:
+            from polymarket_bot.research.weather_capture import (
+                capture_observations, update_outcomes,
+            )
+            capture_observations(
+                window_seconds=config.research_window_seconds,
+                dedupe_seconds=config.research_dedupe_seconds,
+                days_ahead=config.days_ahead,
+            )
+            update_outcomes()
+        except Exception as exc:
+            logger.warning("research_capture_error", error=str(exc)[:200])
+
     # Sample MTM equity into the curve so the chart populates between settlements.
     _maybe_sample_equity(config)
 
@@ -417,6 +432,19 @@ def main() -> None:
     sub.add_parser("redemptions",
                    help="List winning YES positions that still need to be redeemed for USDC.")
 
+    p_bw = sub.add_parser(
+        "backtest-weather",
+        help="Rank candidate weather cities by historical model-vs-market edge.",
+    )
+    p_bw.add_argument("--days", type=int, default=60)
+    p_bw.add_argument("--cities", default=None,
+                      help="Comma-separated city slugs (default: all 36 candidates).")
+    p_bw.add_argument("--edge-threshold", type=float, default=0.05)
+    p_bw.add_argument("--kelly", type=float, default=0.25)
+    p_bw.add_argument("--max-bet-pct", type=float, default=0.05)
+    p_bw.add_argument("--bet-offset-hours", type=float, default=24.0)
+    p_bw.add_argument("--request-sleep", type=float, default=0.05)
+
     args = parser.parse_args()
     if not args.cmd:
         parser.print_help()
@@ -430,8 +458,23 @@ def main() -> None:
     DISPATCH = {
         "run": cmd_run,
         "redemptions": _wrap_with_init(cmd_redemptions),
+        "backtest-weather": _cmd_backtest_weather,
     }
     DISPATCH[args.cmd](config, args)
+
+
+def _cmd_backtest_weather(config: BotConfig, args: argparse.Namespace) -> None:
+    from polymarket_bot.backtest.weather_city_eval import CANDIDATES, cmd_main
+    argv = [
+        "--days", str(args.days),
+        "--cities", args.cities or ",".join(CANDIDATES),
+        "--edge-threshold", str(args.edge_threshold),
+        "--kelly", str(args.kelly),
+        "--max-bet-pct", str(args.max_bet_pct),
+        "--bet-offset-hours", str(args.bet_offset_hours),
+        "--request-sleep", str(args.request_sleep),
+    ]
+    cmd_main(argv)
 
 
 def _wrap_with_init(fn):

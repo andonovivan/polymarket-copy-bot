@@ -40,18 +40,35 @@ class City:
     event_slug_prefix: str               # e.g. "highest-temperature-in-paris-on-"
 
 
-# Allowlist seeded by the Phase 0.5 backtest: cities where the multi-model
-# ensemble beat Polymarket closing prices on settled markets. US cities are
-# excluded (efficient pricing per backtest).
+# Allowlist seeded by backtest: cities where the multi-model ensemble beat
+# Polymarket pricing on settled markets. US cities are excluded (efficient
+# pricing per backtest). Initial 4 (paris/madrid/london/tokyo) used airport
+# stations from the Phase 0.5 backtest; the 7 added below were chosen by the
+# 36-city × 60-day Path A sweep (top simulated Kelly PnL) and use city-centre
+# coordinates from the Open-Meteo geocoder.
 CITY_REGISTRY: dict[str, City] = {
-    "paris":  City("paris",  49.0097,    2.5479, "Europe/Paris",  "celsius",
-                   "highest-temperature-in-paris-on-"),
-    "madrid": City("madrid", 40.4936,   -3.5668, "Europe/Madrid", "celsius",
-                   "highest-temperature-in-madrid-on-"),
-    "london": City("london", 51.5053,    0.0552, "Europe/London", "celsius",
-                   "highest-temperature-in-london-on-"),
-    "tokyo":  City("tokyo",  35.5494,  139.7798, "Asia/Tokyo",    "celsius",
-                   "highest-temperature-in-tokyo-on-"),
+    "paris":     City("paris",     49.0097,    2.5479, "Europe/Paris",    "celsius",
+                      "highest-temperature-in-paris-on-"),
+    "madrid":    City("madrid",    40.4936,   -3.5668, "Europe/Madrid",   "celsius",
+                      "highest-temperature-in-madrid-on-"),
+    "london":    City("london",    51.5053,    0.0552, "Europe/London",   "celsius",
+                      "highest-temperature-in-london-on-"),
+    "tokyo":     City("tokyo",     35.5494,  139.7798, "Asia/Tokyo",      "celsius",
+                      "highest-temperature-in-tokyo-on-"),
+    "taipei":    City("taipei",    25.0531,  121.5264, "Asia/Taipei",     "celsius",
+                      "highest-temperature-in-taipei-on-"),
+    "moscow":    City("moscow",    55.7522,   37.6156, "Europe/Moscow",   "celsius",
+                      "highest-temperature-in-moscow-on-"),
+    "chengdu":   City("chengdu",   30.6667,  104.0667, "Asia/Shanghai",   "celsius",
+                      "highest-temperature-in-chengdu-on-"),
+    "shanghai":  City("shanghai",  31.2222,  121.4581, "Asia/Shanghai",   "celsius",
+                      "highest-temperature-in-shanghai-on-"),
+    "chongqing": City("chongqing", 29.5603,  106.5577, "Asia/Shanghai",   "celsius",
+                      "highest-temperature-in-chongqing-on-"),
+    "helsinki":  City("helsinki",  60.1695,   24.9354, "Europe/Helsinki", "celsius",
+                      "highest-temperature-in-helsinki-on-"),
+    "beijing":   City("beijing",   39.9075,  116.3972, "Asia/Shanghai",   "celsius",
+                      "highest-temperature-in-beijing-on-"),
 }
 
 

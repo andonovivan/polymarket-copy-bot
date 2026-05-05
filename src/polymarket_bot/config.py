@@ -33,7 +33,7 @@ class BotConfig(BaseModel):
 
     # --- Weather params ---
     weather_cities: str = Field(
-        default="paris,madrid,london,tokyo",
+        default="paris,madrid,london,tokyo,taipei,moscow,chengdu,shanghai,chongqing,helsinki,beijing",
         description="Comma-separated city keys from CITY_REGISTRY (allowlist).",
     )
     days_ahead: int = Field(default=4, description="How many upcoming days of markets to consider")
@@ -72,6 +72,14 @@ class BotConfig(BaseModel):
     live_confirm: bool = Field(default=False,
                                description="Set true via POLYMARKET_BOT_LIVE=1 to enable real-money trading")
 
+    # --- Research / live-capture (Path B for city evaluation) ---
+    research_enabled: bool = Field(default=False,
+                                   description="Capture model_p / market_p / outcome for non-promoted candidate cities")
+    research_window_seconds: int = Field(default=3600,
+                                         description="Only snapshot events settling within this many seconds")
+    research_dedupe_seconds: int = Field(default=600,
+                                         description="Skip if same (city, slug, bucket) was observed this recently")
+
     @classmethod
     def from_env(cls) -> BotConfig:
         return cls(
@@ -83,7 +91,10 @@ class BotConfig(BaseModel):
             api_secret=os.getenv("POLYMARKET_API_SECRET", ""),
             api_passphrase=os.getenv("POLYMARKET_API_PASSPHRASE", ""),
             strategy=os.getenv("STRATEGY", "weather_forecast"),
-            weather_cities=os.getenv("WEATHER_CITIES", "paris,madrid,london,tokyo"),
+            weather_cities=os.getenv(
+                "WEATHER_CITIES",
+                "paris,madrid,london,tokyo,taipei,moscow,chengdu,shanghai,chongqing,helsinki,beijing",
+            ),
             days_ahead=int(os.getenv("DAYS_AHEAD", "4")),
             edge_threshold=float(os.getenv("EDGE_THRESHOLD", "0.05")),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
@@ -98,4 +109,7 @@ class BotConfig(BaseModel):
             dashboard_port=int(os.getenv("DASHBOARD_PORT", "8080")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             live_confirm=os.getenv("POLYMARKET_BOT_LIVE", "0") == "1",
+            research_enabled=os.getenv("RESEARCH_ENABLED", "0") == "1",
+            research_window_seconds=int(os.getenv("RESEARCH_WINDOW_SECONDS", "3600")),
+            research_dedupe_seconds=int(os.getenv("RESEARCH_DEDUPE_SECONDS", "600")),
         )
