@@ -13,8 +13,9 @@ from polymarket_bot.strategy.calibration import (
     apply_bias_correction,
     apply_calibration,
     bucket_temp_midpoint,
-    compute_city_bias,
+    compute_city_bias_curve,
     compute_city_calibrator,
+    get_city_bias_curve,
     reset_caches,
 )
 
@@ -77,50 +78,108 @@ def _seed_winning_obs(city_key: str, model_day_max: float, label: str,
     conn.commit()
 
 
-def test_bias_zero_when_no_data(tmp_db):
-    assert compute_city_bias("paris") == 0.0
+def test_bias_curve_none_when_no_data(tmp_db):
+    assert compute_city_bias_curve("paris") is None
 
 
-def test_bias_zero_below_min_events(tmp_db):
+def test_bias_curve_none_below_min_events(tmp_db):
     # Insert fewer than MIN_BIAS_EVENTS rows.
     for i in range(MIN_BIAS_EVENTS - 1):
         _seed_winning_obs("paris", model_day_max=20.0, label="18°C",
                           observed_at=int(time.time()) - i * 86400)
-    assert compute_city_bias("paris") == 0.0
+    assert compute_city_bias_curve("paris") is None
 
 
-def test_bias_median_signed(tmp_db):
-    # Insert 11 winning observations: model predicted 20°C, actual was 18°C.
-    # Median bias should be +2.0 (model overshoots by 2°C).
+def test_bias_curve_constant_when_no_temp_variation(tmp_db):
+    # All samples at the same model_temp → degenerate slope, returns the
+    # mean error as a constant function regardless of input temperature.
     for i in range(MIN_BIAS_EVENTS + 1):
         _seed_winning_obs("paris", model_day_max=20.0, label="18°C",
                           observed_at=int(time.time()) - i * 86400)
-    assert compute_city_bias("paris") == 2.0
+    fn = compute_city_bias_curve("paris")
+    assert fn is not None
+    assert abs(fn(20.0) - 2.0) < 1e-9
+    assert abs(fn(15.0) - 2.0) < 1e-9   # constant outside observed range
 
 
-def test_bias_handles_negative_offset(tmp_db):
-    # Model under-predicts by 1°C consistently → median bias = -1.0.
+def test_bias_curve_cached_path_degenerate_slope(tmp_db):
+    """Regression: get_city_bias_curve reads `.range`/`.slope`/`.intercept`
+    off the returned callable to log telemetry. The degenerate constant-temp
+    case must carry the same metadata so the cached path doesn't crash."""
     for i in range(MIN_BIAS_EVENTS + 1):
-        _seed_winning_obs("paris", model_day_max=15.0, label="16°C",
+        _seed_winning_obs("paris", model_day_max=20.0, label="18°C",
                           observed_at=int(time.time()) - i * 86400)
-    assert compute_city_bias("paris") == -1.0
+    fn = get_city_bias_curve("paris")
+    assert fn is not None
+    # Must work regardless of which compute path produced the function.
+    assert fn.range == (20.0, 20.0)
+    assert fn.slope == 0.0
+    assert abs(fn.intercept - 2.0) < 1e-9
+    assert abs(fn(20.0) - 2.0) < 1e-9
 
 
-def test_apply_bias_correction_is_noop_at_zero():
+def test_bias_curve_captures_temperature_dependence(tmp_db):
+    # Synthesize a clear temperature-dependent bias:
+    #   - At cold model_temp = 5°C: actual was 4°C (model over-predicts by 1)
+    #   - At warm model_temp = 25°C: actual was 26°C (model under-predicts by 1)
+    # A linear regression should produce slope ≈ -0.1 and intercept ≈ 1.5,
+    # so the curve crosses zero around 15°C.
+    now = int(time.time())
+    for i in range(6):
+        _seed_winning_obs("paris", model_day_max=5.0, label="4°C",
+                          observed_at=now - i * 86400)
+    for i in range(6):
+        _seed_winning_obs("paris", model_day_max=25.0, label="26°C",
+                          observed_at=now - (i + 6) * 86400)
+    fn = compute_city_bias_curve("paris")
+    assert fn is not None
+    # At cold end: model over-predicts → bias > 0.
+    assert fn(5.0) > 0.5
+    # At warm end: model under-predicts → bias < 0.
+    assert fn(25.0) < -0.5
+    # Mid-range: smaller magnitude.
+    assert abs(fn(15.0)) < abs(fn(5.0))
+
+
+def test_bias_curve_clamps_extrapolation(tmp_db):
+    # Observed range is [10, 20]. Inputs outside that range should clamp to
+    # the boundary values, never extrapolate to absurd biases.
+    now = int(time.time())
+    for i in range(6):
+        _seed_winning_obs("paris", model_day_max=10.0, label="9°C",
+                          observed_at=now - i * 86400)
+    for i in range(6):
+        _seed_winning_obs("paris", model_day_max=20.0, label="19°C",
+                          observed_at=now - (i + 6) * 86400)
+    fn = compute_city_bias_curve("paris")
+    assert fn is not None
+    val_at_lo = fn(10.0)
+    val_at_hi = fn(20.0)
+    # Far below lower bound → same as at lower bound.
+    assert abs(fn(-50.0) - val_at_lo) < 1e-9
+    # Far above upper bound → same as at upper bound.
+    assert abs(fn(100.0) - val_at_hi) < 1e-9
+
+
+def test_apply_bias_correction_passthrough_when_none():
     members = [16, 17, 18]
-    assert apply_bias_correction(members, 0.0) is members
+    assert apply_bias_correction(members, None) is members
 
 
-def test_apply_bias_correction_rounds_to_int():
-    # bias = +1.4 → shift down by ~1.4, rounded → most members drop by 1.
-    out = apply_bias_correction([16, 17, 18, 19], 1.4)
-    assert out == [15, 16, 17, 18]
+def test_apply_bias_correction_uses_local_bias_per_member():
+    # Constant bias function: f(t) = +1.5 → each member shifts down by ~1.5,
+    # rounded.
+    fn = lambda _t: 1.5
+    out = apply_bias_correction([16, 17, 18, 19], fn)
+    assert out == [14, 16, 16, 18]   # round half to even via int(round(...))
 
 
-def test_apply_bias_correction_negative():
-    # bias = -2 → model under-predicts; shift members UP by 2.
-    out = apply_bias_correction([10, 11, 12], -2.0)
-    assert out == [12, 13, 14]
+def test_apply_bias_correction_temperature_dependent():
+    # Per-member bias varying with temperature: cold members get a +1
+    # correction, warm members get a -1 correction.
+    fn = lambda t: 1.0 if t < 15 else -1.0
+    out = apply_bias_correction([10, 12, 18, 20], fn)
+    assert out == [9, 11, 19, 21]
 
 
 # ---------------------------------------------------------------------------

@@ -2,21 +2,30 @@
 
 Two layers, applied in order inside `_attach_model_probabilities`:
 
-  1. **Bias correction (#1).** `compute_city_bias(city_key)` returns the
-     median signed error `(model_day_max_mean − actual_day_max)` over recent
-     settled events from `weather_research_obs`. The caller subtracts this
-     from each ensemble member before bucketing, shifting probability mass
-     into the buckets that actually occur.
+  1. **Temperature-conditional bias correction (#1).**
+     `compute_city_bias_curve(city_key)` fits a linear regression of
+     forecast error against the forecast temperature itself, over recent
+     settled events:
 
-  2. **Isotonic calibration (#2).** `compute_city_calibrator(city_key)`
-     fits an isotonic regression `(model_p, won) → calibrated_p` over recent
-     bucket-level observations from the same table. Returns a callable that
-     maps any model probability into a calibrated probability.
+         error(model_temp) = a + b · model_temp
+
+     The caller evaluates this curve at each ensemble member's value and
+     subtracts the local bias before bucketing. This naturally captures
+     seasonal patterns (e.g. cold-month over-prediction vs warm-month
+     under-prediction) without explicit seasonality buckets — when warm
+     observations dominate the lookback window, the curve reflects the
+     warm-regime bias; when the city transitions seasons, the curve adapts
+     as new data arrives.
+
+  2. **Isotonic probability calibration (#2).**
+     `compute_city_calibrator(city_key)` fits an isotonic regression
+     `(model_p, won) → calibrated_p` over recent bucket-level observations
+     from the same table. Returns a callable that maps any model
+     probability into a calibrated probability.
 
 Both layers are pass-through (no-op) when there isn't enough data — they
-return `0.0` bias and `None` calibrator respectively. The bot keeps trading
-the raw ensemble until 30+ events accumulate, at which point the corrections
-kick in automatically.
+return `None`. The bot keeps trading the raw ensemble until enough events
+accumulate, at which point the corrections kick in automatically.
 
 Recent fits are cached in-process for `CACHE_TTL_SECONDS` to keep tick-loop
 overhead near zero.
@@ -26,7 +35,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Callable
+from typing import Callable, Optional
 
 import structlog
 from sklearn.isotonic import IsotonicRegression
@@ -50,7 +59,8 @@ MIN_CALIBRATION_OBS = 110
 DEFAULT_LOOKBACK_DAYS = 30
 
 
-_BIAS_CACHE: dict[str, tuple[float, float]] = {}            # key → (fitted_at, bias)
+# Cache: key → (fitted_at, bias_curve_callable_or_None).
+_BIAS_CACHE: dict[str, tuple[float, "Optional[Callable[[float], float]]"]] = {}
 _CALIBRATOR_CACHE: dict[str, tuple[float, "IsotonicRegression | None"]] = {}
 
 
@@ -80,8 +90,14 @@ def bucket_temp_midpoint(label: str) -> float | None:
 # #1 — Bias correction
 # ---------------------------------------------------------------------------
 
-def _query_bias_samples(city_key: str, lookback_days: int) -> list[float]:
-    """Fetch (model_day_max_mean − actual_day_max) per settled event."""
+def _query_bias_samples(city_key: str,
+                        lookback_days: int) -> list[tuple[float, float]]:
+    """Fetch (model_day_max_mean, error) pairs per settled event.
+
+    `error` is `model_day_max_mean − actual_day_max`, where actual is the
+    midpoint of the winning bucket (bucket-resolution noise of ±0.5°C is
+    averaged out across multiple events).
+    """
     conn = get_conn()
     cutoff = int(time.time()) - lookback_days * 86400
     with lock():
@@ -92,47 +108,93 @@ def _query_bias_samples(city_key: str, lookback_days: int) -> list[float]:
             "  AND observed_at >= ? ",
             (city_key, cutoff),
         ).fetchall()
-    # One observation per (event, winning bucket) row. The winning bucket's
-    # midpoint approximates the actual day-max with bucket-resolution noise.
-    samples: list[float] = []
-    for slug, _ts, model_mean, label in rows:
+    samples: list[tuple[float, float]] = []
+    for _slug, _ts, model_mean, label in rows:
         actual = bucket_temp_midpoint(label)
         if actual is None or model_mean is None:
             continue
-        samples.append(float(model_mean) - actual)
+        samples.append((float(model_mean), float(model_mean) - actual))
     return samples
 
 
-def compute_city_bias(city_key: str, *,
-                      lookback_days: int = DEFAULT_LOOKBACK_DAYS,
-                      min_events: int = MIN_BIAS_EVENTS) -> float:
-    """Median (model − actual) day-max bias for the city, or 0.0 if insufficient."""
+def compute_city_bias_curve(city_key: str, *,
+                            lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+                            min_events: int = MIN_BIAS_EVENTS,
+                            ) -> "Optional[Callable[[float], float]]":
+    """Fit a linear `model_temp → expected_error` regression for one city.
+
+    Returns a callable that takes a forecast temperature and returns the
+    expected `(model − actual)` bias at that temperature, or None if there
+    aren't enough samples yet.
+
+    The returned function clamps inputs to the observed temperature range so
+    we never extrapolate wildly (e.g. into temperatures the city has never
+    seen in our window).
+    """
     samples = _query_bias_samples(city_key, lookback_days)
     if len(samples) < min_events:
-        return 0.0
-    samples.sort()
+        return None
+
     n = len(samples)
-    return samples[n // 2] if n % 2 else (samples[n // 2 - 1] + samples[n // 2]) / 2
+    sx = sum(t for t, _ in samples)
+    sy = sum(e for _, e in samples)
+    sxx = sum(t * t for t, _ in samples)
+    sxy = sum(t * e for t, e in samples)
+    denom = n * sxx - sx * sx
+    min_t = min(t for t, _ in samples)
+    max_t = max(t for t, _ in samples)
+    if denom == 0:
+        # All samples at identical model_temp — degenerate slope; use the
+        # mean error as a constant function.
+        slope = 0.0
+        intercept = sy / n
+    else:
+        slope = (n * sxy - sx * sy) / denom
+        intercept = (sy - slope * sx) / n
+
+    def f(model_temp: float) -> float:
+        clamped = max(min_t, min(max_t, model_temp))
+        return intercept + slope * clamped
+
+    # Stamp the function with metadata for the cache log + telemetry.
+    f.slope = slope          # type: ignore[attr-defined]
+    f.intercept = intercept  # type: ignore[attr-defined]
+    f.range = (min_t, max_t) # type: ignore[attr-defined]
+    return f
 
 
-def get_city_bias(city_key: str) -> float:
-    """Cached `compute_city_bias`. Returns 0.0 when there isn't enough history."""
+def get_city_bias_curve(city_key: str) -> "Optional[Callable[[float], float]]":
+    """Cached `compute_city_bias_curve`. Returns None when insufficient data."""
     now = time.time()
     cached = _BIAS_CACHE.get(city_key)
     if cached and now - cached[0] < CACHE_TTL_SECONDS:
         return cached[1]
-    bias = compute_city_bias(city_key)
-    _BIAS_CACHE[city_key] = (now, bias)
-    if abs(bias) > 0:
-        logger.info("city_bias_fitted", city=city_key, bias=round(bias, 2))
-    return bias
+    fn = compute_city_bias_curve(city_key)
+    _BIAS_CACHE[city_key] = (now, fn)
+    if fn is not None:
+        lo, hi = fn.range  # type: ignore[attr-defined]
+        logger.info(
+            "city_bias_curve_fitted", city=city_key,
+            slope=round(fn.slope, 3),       # type: ignore[attr-defined]
+            intercept=round(fn.intercept, 2),  # type: ignore[attr-defined]
+            range=f"{lo:.1f}–{hi:.1f}°",
+            bias_at_lo=round(fn(lo), 2),
+            bias_at_hi=round(fn(hi), 2),
+        )
+    return fn
 
 
-def apply_bias_correction(members: list[int], bias: float) -> list[int]:
-    """Shift each ensemble member by `-bias` (rounded back to int)."""
-    if bias == 0.0:
+def apply_bias_correction(members: list[int],
+                          bias_fn: "Optional[Callable[[float], float]]",
+                          ) -> list[int]:
+    """Shift each ensemble member by its locally-estimated bias.
+
+    `bias_fn(t)` returns the expected `(model − actual)` error at forecast
+    temperature `t`; we subtract that from `t` to recover the implied actual.
+    """
+    if bias_fn is None:
         return members
-    return [int(round(m - bias)) for m in members]
+    return [int(round(m - bias_fn(float(m)))) for m in members]
 
 
 # ---------------------------------------------------------------------------

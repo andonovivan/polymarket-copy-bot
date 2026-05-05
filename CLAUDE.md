@@ -205,13 +205,21 @@ Two layers stacked on top of the raw ensemble inside
 Path B data accumulates**, so the bot keeps trading the raw ensemble in the
 meantime and the corrections kick in automatically once data is present.
 
-**Layer 1 — per-city bias correction.** For each settled event we have
-`model_day_max_mean` (ensemble mean) and the winning bucket's midpoint
-(actual day-max with bucket-resolution noise). The bias is the median of
-`(model − actual)` over the last 30 days (≥10 events required); we shift
-each ensemble member by `-bias` before bucketing. Catches systematic
-forecast biases that Open-Meteo grids sometimes have over particular
-cities (urban heat island, station siting, etc.).
+**Layer 1 — per-city, temperature-conditional bias correction.** For each
+settled event we have `model_day_max_mean` (ensemble mean) and the winning
+bucket's midpoint (actual day-max with bucket-resolution noise). We fit a
+**linear regression of forecast error against forecast temperature** over
+the last 30 days (≥10 events required):
+
+    error(model_temp) = a + b · model_temp
+
+Each ensemble member is then shifted by its locally-evaluated bias before
+bucketing — cold members get the cold-end correction, warm members the
+warm-end correction. This handles the seasonality blind spot that a single
+median bias would mask: a model that's +1°C in winter and -0.5°C in summer
+shows up as a non-zero slope that adapts naturally as the lookback window
+slides through the seasons. Inputs outside the observed temperature range
+are clamped to the boundary values (no wild extrapolation).
 
 **Layer 2 — isotonic probability calibration.** Counting-style ensemble
 probabilities are usually under-dispersive (overconfident on the modal

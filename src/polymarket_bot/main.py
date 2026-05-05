@@ -114,7 +114,7 @@ def _attach_model_probabilities(event: WeatherEvent) -> int:
     """
     from polymarket_bot.strategy.calibration import (
         apply_bias_correction, apply_calibration,
-        get_city_bias, get_city_calibrator,
+        get_city_bias_curve, get_city_calibrator,
     )
 
     city = CITY_REGISTRY.get(event.city_key)
@@ -126,8 +126,8 @@ def _attach_model_probabilities(event: WeatherEvent) -> int:
     forecast = get_ensemble(city, target_date)
     if forecast is None or not forecast.members:
         return 0
-    bias = get_city_bias(event.city_key)
-    members = apply_bias_correction(forecast.members, bias)
+    bias_curve = get_city_bias_curve(event.city_key)
+    members = apply_bias_correction(forecast.members, bias_curve)
     labels = [b.label for b in event.buckets]
     probs = bucket_probabilities(members, labels)
     calibrator = get_city_calibrator(event.city_key)
