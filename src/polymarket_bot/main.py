@@ -464,16 +464,19 @@ def main() -> None:
 
 
 def _cmd_backtest_weather(config: BotConfig, args: argparse.Namespace) -> None:
-    from polymarket_bot.backtest.weather_city_eval import CANDIDATES, cmd_main
+    from polymarket_bot.backtest.weather_city_eval import cmd_main
     argv = [
         "--days", str(args.days),
-        "--cities", args.cities or ",".join(CANDIDATES),
         "--edge-threshold", str(args.edge_threshold),
         "--kelly", str(args.kelly),
         "--max-bet-pct", str(args.max_bet_pct),
         "--bet-offset-hours", str(args.bet_offset_hours),
         "--request-sleep", str(args.request_sleep),
     ]
+    # Only forward --cities if explicitly set; otherwise let cmd_main use its
+    # own default (the full CANDIDATES list).
+    if args.cities:
+        argv += ["--cities", args.cities]
     cmd_main(argv)
 
 

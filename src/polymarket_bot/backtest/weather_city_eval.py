@@ -94,29 +94,68 @@ class CityScore:
     n_bets: int
 
 
-_GEOCODE_CACHE: dict[str, GeoInfo | None] = {}
+_GEOCODE_CACHE: dict[str, GeoInfo] = {}
+# Cache: token_id → list[(t, p)] price history. Each token's full history is
+# tens of points; fetching it once per (city, day, bucket) was ~24k requests
+# per sweep — caching by token cuts that to ~3000.
+_PRICE_HISTORY_CACHE: dict[str, list[tuple[int, float]]] = {}
 
 
-def _http_get_json(url: str, timeout: float = 15.0) -> dict | list | None:
+def _http_get_json(url: str, timeout: float = 15.0,
+                   max_retries: int = 3) -> dict | list | None:
+    """GET → parsed JSON. Returns None on terminal failure.
+
+    Retries on transient errors (5xx, 429, network) with exponential backoff.
+    Honors `Retry-After` on 429 if present. 4xx errors other than 429 are
+    treated as terminal and not retried.
+    """
     req = urllib.request.Request(
         url, headers={"User-Agent": "polymarket-bot-backtest/0.1"}
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read())
-    except Exception as exc:
-        logger.warning("http_error", url=url[:120], error=str(exc)[:200])
-        return None
+    delay = 1.0
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                wait = float(exc.headers.get("Retry-After") or delay)
+                logger.warning("http_429", url=url[:120], wait=wait,
+                               attempt=attempt + 1)
+                time.sleep(wait)
+                delay *= 2
+                continue
+            if 500 <= exc.code < 600:
+                logger.warning("http_5xx", url=url[:120], code=exc.code,
+                               attempt=attempt + 1)
+                time.sleep(delay)
+                delay *= 2
+                continue
+            logger.warning("http_4xx", url=url[:120], code=exc.code)
+            return None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            logger.warning("http_network", url=url[:120],
+                           error=str(exc)[:200], attempt=attempt + 1)
+            time.sleep(delay)
+            delay *= 2
+            continue
+        except Exception as exc:
+            logger.warning("http_error", url=url[:120], error=str(exc)[:200])
+            return None
+    logger.warning("http_gave_up", url=url[:120], retries=max_retries)
+    return None
 
 
 def geocode(slug: str) -> GeoInfo | None:
+    """Geocode `slug` via Open-Meteo. Returns None on lookup failure WITHOUT
+    caching the failure — so a transient API outage doesn't permanently
+    blacklist the city for the lifetime of the process."""
     if slug in _GEOCODE_CACHE:
         return _GEOCODE_CACHE[slug]
     name = GEOCODE_OVERRIDE.get(slug, slug.replace("-", " ").title())
     url = f"{GEOCODE_URL}?name={urllib.parse.quote(name)}&count=1&format=json"
     data = _http_get_json(url)
     if not isinstance(data, dict) or not data.get("results"):
-        _GEOCODE_CACHE[slug] = None
         return None
     r = data["results"][0]
     info = GeoInfo(
@@ -190,22 +229,31 @@ def fetch_settled_event(slug: str) -> dict | None:
             "unit": unit or "celsius", "end_ts": end_ts}
 
 
-def fetch_yes_price_at(token_id: str, target_ts: int) -> float | None:
-    """Latest YES-side trade price at or before `target_ts`, or None."""
+def _fetch_price_history(token_id: str) -> list[tuple[int, float]]:
+    """Return the full YES-side price history (sorted by ts), cached per token."""
+    cached = _PRICE_HISTORY_CACHE.get(token_id)
+    if cached is not None:
+        return cached
     url = f"{CLOB_PRICES_HISTORY_URL}?market={token_id}&interval=max"
     data = _http_get_json(url)
-    if not isinstance(data, dict):
-        return None
-    history = data.get("history") or []
+    history: list[tuple[int, float]] = []
+    if isinstance(data, dict):
+        for pt in data.get("history") or []:
+            try:
+                history.append((int(pt["t"]), float(pt["p"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    _PRICE_HISTORY_CACHE[token_id] = history
+    return history
+
+
+def fetch_yes_price_at(token_id: str, target_ts: int) -> float | None:
+    """Latest YES-side trade price at or before `target_ts`, or None."""
+    history = _fetch_price_history(token_id)
     if not history:
         return None
     latest_p: float | None = None
-    for pt in history:
-        try:
-            t = int(pt["t"])
-            p = float(pt["p"])
-        except (KeyError, TypeError, ValueError):
-            continue
+    for t, p in history:
         if t <= target_ts:
             latest_p = p
         else:
@@ -287,8 +335,12 @@ def evaluate_city(
         bet_ts = ev["end_ts"] - bet_offset
         n_priced = 0
         for label, yes_token in ev["buckets"]:
+            # Only pay the request_sleep tax on a cache miss — repeat lookups
+            # within a sweep are cheap.
+            cache_hit = yes_token in _PRICE_HISTORY_CACHE
             market_p = fetch_yes_price_at(yes_token, bet_ts)
-            time.sleep(request_sleep)
+            if not cache_hit:
+                time.sleep(request_sleep)
             if market_p is None:
                 continue
             p = probs.get(label, 0.0)

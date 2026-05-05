@@ -16,6 +16,12 @@
   const fmtNum = (n, d = 4) => (n == null ? "—" : Number(n).toFixed(d));
   const fmtTs = (s) => new Date(s * 1000).toLocaleString();
 
+  // Escape any string going into an HTML context. Polymarket market titles
+  // aren't typically hostile, but they're external data — never trust them
+  // raw inside an attribute or text node.
+  const ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+  const esc = (s) => (s == null ? "" : String(s).replace(/[&<>"']/g, (c) => ESC_MAP[c]));
+
   async function api(path) {
     const r = await fetch(path);
     if (!r.ok) throw new Error(path + " " + r.status);
@@ -53,16 +59,26 @@
       this.fetcher = opts.fetcher || null;
       this.pageSize = opts.pageSize || 50;
       this.emptyText = opts.emptyText || "No rows.";
-      this._rows = [];
+      this._rows = (opts.initialRows || []).slice();
       this._sortKey = opts.initialSort && opts.initialSort.key || null;
       this._sortDir = opts.initialSort && opts.initialSort.dir || "desc";
       this._offset = 0;
       this._hasMore = false;
       this._loading = false;
-      this._initialFetched = !this.fetcher;   // data mode is "ready" immediately
+      // Data mode is "ready" immediately. Fetcher mode becomes ready after the
+      // first fetch resolves; if initialRows were provided, treat that as the
+      // first page and skip the auto-fetch.
+      this._initialFetched = !this.fetcher || this._rows.length > 0;
       this._observer = null;
       this._render();
-      if (this.fetcher) this._loadMore();
+      if (this.fetcher && this._rows.length === 0) this._loadMore();
+    }
+
+    destroy() {
+      if (this._observer) {
+        this._observer.disconnect();
+        this._observer = null;
+      }
     }
 
     setRows(rows) {
@@ -150,7 +166,9 @@
         } else {
           html = rows.map((row) => {
             const tds = this.columns.map((c) => {
-              const v = c.format ? c.format(row) : (row[c.key] == null ? "" : String(row[c.key]));
+              // Format functions own their HTML output (and are responsible for
+              // escaping); the raw fallback escapes by default.
+              const v = c.format ? c.format(row) : esc(row[c.key]);
               return `<td>${v}</td>`;
             }).join("");
             return `<tr>${tds}</tr>`;
@@ -201,8 +219,11 @@
   // Column sets
   // ===========================================================================
 
-  const titleCell = (r) =>
-    `<span title="${r.market_id || ""}">${r.title || (r.market_id || "").slice(0, 14) + "…"}</span>`;
+  const titleCell = (r) => {
+    const mid = r.market_id || "";
+    const display = r.title || (mid.slice(0, 14) + "…");
+    return `<span title="${esc(mid)}">${esc(display)}</span>`;
+  };
   const titleSort = (r) => (r.title || r.market_id || "").toLowerCase();
 
   const INVENTORY_COLS = [
@@ -225,8 +246,8 @@
   const ORDER_COLS = [
     { key: "placed_at",  label: "Placed", format: (r) => fmtTs(r.placed_at) },
     { key: "title",      label: "Market", format: titleCell, sortKey: titleSort },
-    { key: "token_side", label: "Token",  format: (r) => r.token_side },
-    { key: "side",       label: "Side",   format: (r) => r.side },
+    { key: "token_side", label: "Token",  format: (r) => esc(r.token_side) },
+    { key: "side",       label: "Side",   format: (r) => esc(r.side) },
     { key: "price",      label: "Price",  format: (r) => fmtNum(r.price, 3) },
     { key: "size",       label: "Size",   format: (r) => fmtNum(r.size, 2) },
     { key: "filled",     label: "Filled", format: (r) => fmtNum(r.filled, 2) },
@@ -235,8 +256,8 @@
   const FILL_COLS = [
     { key: "fill_ts",    label: "Filled", format: (r) => fmtTs(r.fill_ts) },
     { key: "title",      label: "Market", format: titleCell, sortKey: titleSort },
-    { key: "token_side", label: "Token",  format: (r) => r.token_side },
-    { key: "side",       label: "Side",   format: (r) => r.side },
+    { key: "token_side", label: "Token",  format: (r) => esc(r.token_side) },
+    { key: "side",       label: "Side",   format: (r) => esc(r.side) },
     { key: "price",      label: "Price",  format: (r) => fmtNum(r.price, 3) },
     { key: "size",       label: "Size",   format: (r) => fmtNum(r.size, 2) },
     {
@@ -249,7 +270,7 @@
   const SETTLEMENT_COLS = [
     { key: "settled_at",   label: "Settled", format: (r) => fmtTs(r.settled_at) },
     { key: "title",        label: "Market",  format: titleCell, sortKey: titleSort },
-    { key: "outcome",      label: "Outcome", format: (r) => r.outcome },
+    { key: "outcome",      label: "Outcome", format: (r) => esc(r.outcome) },
     { key: "yes_shares",   label: "YES",     format: (r) => fmtNum(r.yes_shares, 2) },
     { key: "avg_yes_cost", label: "Avg YES", format: (r) => fmtUsd(r.avg_yes_cost) },
     { key: "no_shares",    label: "NO",      format: (r) => fmtNum(r.no_shares, 2) },
@@ -266,7 +287,7 @@
   ];
 
   const STRATEGY_COLS = [
-    { key: "name",    label: "Name",    format: (r) => r.name },
+    { key: "name",    label: "Name",    format: (r) => esc(r.name) },
     { key: "enabled", label: "Enabled", format: (r) => (r.enabled ? "✓" : "") },
   ];
 
@@ -301,6 +322,20 @@
   let _invTable = null;
   let _ordersTable = null;
   let _dashFillsTable = null;
+  // Tables on standalone pages — destroyed and recreated when the user
+  // navigates between routes. Tracking them lets us release the
+  // IntersectionObserver on tear-down and preserve sort state when a
+  // refresh tick wants to update a page in place.
+  let _fillsPageTable = null;
+  let _settlementsPageTable = null;
+  let _strategiesTable = null;
+
+  function _destroyStandaloneTables() {
+    [_fillsPageTable, _settlementsPageTable, _strategiesTable].forEach((t) => {
+      if (t) t.destroy();
+    });
+    _fillsPageTable = _settlementsPageTable = _strategiesTable = null;
+  }
 
   function buildDashboardSkeleton() {
     $("#page").innerHTML = `
@@ -410,7 +445,7 @@
   function pageFills() {
     setText("#page-title", "Fills");
     $("#page").innerHTML = `<div class="section"><div id="fills-table"></div></div>`;
-    new Table($("#fills-table"), {
+    _fillsPageTable = new Table($("#fills-table"), {
       columns: FILL_COLS,
       pageSize: 50,
       fetcher: ({ offset, limit }) =>
@@ -425,7 +460,7 @@
   function pageSettlements() {
     setText("#page-title", "Settlements");
     $("#page").innerHTML = `<div class="section"><div id="settlements-table"></div></div>`;
-    new Table($("#settlements-table"), {
+    _settlementsPageTable = new Table($("#settlements-table"), {
       columns: SETTLEMENT_COLS,
       pageSize: 50,
       fetcher: ({ offset, limit }) =>
@@ -439,20 +474,28 @@
 
   async function pageStrategies() {
     setText("#page-title", "Strategies");
-    $("#page").innerHTML = `<div class="section"><div id="strategies-table"></div></div>`;
     const data = await api("/api/strategies").catch(() => ({ strategies: [] }));
-    new Table($("#strategies-table"), {
+    if (_strategiesTable) {
+      // Refresh tick: just push new rows so the user's sort state is preserved.
+      _strategiesTable.setRows(data.strategies || []);
+      return;
+    }
+    $("#page").innerHTML = `<div class="section"><div id="strategies-table"></div></div>`;
+    _strategiesTable = new Table($("#strategies-table"), {
       columns: STRATEGY_COLS,
       emptyText: "No strategies registered.",
       initialSort: { key: "enabled", dir: "desc" },
-    }).setRows(data.strategies || []);
+      initialRows: data.strategies || [],
+    });
   }
 
   async function pageSettings() {
     setText("#page-title", "Settings");
     const cfg = await api("/api/settings").catch(() => ({}));
-    const rows = Object.entries(cfg).map(([k, v]) => `
-      <tr><td style="color: var(--text-dim);">${k}</td><td>${typeof v === "object" ? JSON.stringify(v) : String(v)}</td></tr>`).join("");
+    const rows = Object.entries(cfg).map(([k, v]) => {
+      const value = typeof v === "object" ? JSON.stringify(v) : String(v);
+      return `<tr><td style="color: var(--text-dim);">${esc(k)}</td><td>${esc(value)}</td></tr>`;
+    }).join("");
     setHTMLIfChanged($("#page"), `
       <div class="section">
         <h2 class="section-title">Current configuration</h2>
@@ -497,12 +540,13 @@
     const name = (hash.replace(/^#\//, "").split("?")[0]) || "dashboard";
     const route = ROUTES[name] || ROUTES.dashboard;
     if (name !== "dashboard") _dashboardBuilt = false;
+    _destroyStandaloneTables();
     _activeRoute = name;
     setActiveNav(name);
     try {
       await route.enter();
     } catch (e) {
-      $("#page").innerHTML = `<div class="placeholder">${String(e)}</div>`;
+      $("#page").innerHTML = `<div class="placeholder">${esc(String(e))}</div>`;
     }
   }
 

@@ -220,8 +220,14 @@ The `has_more` field is computed server-side via the cheap `LIMIT N+1` trick
     next page via an `IntersectionObserver` on a sentinel row. Used by the
     Fills and Settlements pages.
 - All tables are sortable: click any column header (toggles asc/desc, shows
-  ▲/▼ arrow). Sort runs over **currently-loaded** rows only — for paginated
-  tables this is a per-window sort, not a global one.
+  ▲/▼ arrow). **Sort is client-side over currently-loaded rows only.** For
+  the paginated Fills / Settlements pages, this means sorting by Price (or
+  any non-default column) only orders the rows already loaded into the DOM;
+  later pages still arrive in the server's order (most-recent first). To
+  sort globally across the whole dataset we'd need server-side sort params.
+- `Table.destroy()` disconnects the `IntersectionObserver`. Standalone-page
+  tables are tracked at module scope so `navigate()` can release them on
+  route exit.
 - Auto-refresh: header every 5s, active page every 10s.
   - **Disabled on Fills + Settlements** to avoid merging new rows into the
     user's scroll position. Re-navigating to those pages re-fetches.

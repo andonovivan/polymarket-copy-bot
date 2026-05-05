@@ -1,5 +1,11 @@
 # polymarket-bot
 
+> ⚠️ **This README is stale.** It describes a previous BTC-direction strategy
+> that no longer exists in the codebase. The current bot bets on Polymarket's
+> daily city-temperature markets using a multi-model weather ensemble. See
+> [CLAUDE.md](CLAUDE.md) for the current architecture, run modes, and CLI
+> commands.
+
 Auto-bettor on Polymarket's recurring **BTC up/down 5-minute** binary markets.
 
 The bot estimates `P(BTC closes up over the next 5 min)` from a logistic-regression model
