@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import json
@@ -26,8 +27,18 @@ import structlog
 logger = structlog.get_logger()
 
 ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
-CACHE_TTL_SECONDS = 30 * 60   # forecasts update ~6h; 30m is safely fresh
+# Open-Meteo's NWP cycles run every ~6h; a 3h cache is comfortably fresh and
+# halves the call rate vs. the previous 30 min, which mattered after Path A
+# + Path B + multiple bot restarts started competing for free-tier quota.
+CACHE_TTL_SECONDS = 3 * 3600
+# When we get a 429, suppress further fetches for this long. Stops the bot
+# from hammering the API on every tick after the limit hits.
+RATE_LIMIT_BACKOFF_SECONDS = 120
 USER_AGENT = "polymarket-bot-weather/0.4"
+
+# Set to a unix timestamp when we get rate-limited; until then, all
+# `_fetch_json` calls short-circuit to None to give the API time to recover.
+_RATE_LIMITED_UNTIL: float = 0.0
 
 
 @dataclass
@@ -83,10 +94,41 @@ class EnsembleForecast:
 _FORECAST_CACHE: dict[tuple[str, str], EnsembleForecast] = {}
 
 
-def _fetch_json(url: str) -> dict:
+def _fetch_json(url: str, *, max_retries: int = 3) -> dict | None:
+    """GET → parsed JSON, or None on terminal/rate-limited failure.
+
+    Honors HTTP 429 with `Retry-After`; sets a process-wide backoff window so
+    every other tick doesn't keep poking the rate-limited API.
+    """
+    global _RATE_LIMITED_UNTIL
+    if time.time() < _RATE_LIMITED_UNTIL:
+        return None
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read())
+    delay = 1.0
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                retry_after = float(exc.headers.get("Retry-After")
+                                    or RATE_LIMIT_BACKOFF_SECONDS)
+                _RATE_LIMITED_UNTIL = time.time() + retry_after
+                logger.warning("ensemble_rate_limited",
+                               retry_after_seconds=retry_after)
+                return None
+            if 500 <= exc.code < 600 and attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+    return None
 
 
 def get_ensemble(city: City, target_date: str) -> EnsembleForecast | None:
@@ -114,6 +156,10 @@ def get_ensemble(city: City, target_date: str) -> EnsembleForecast | None:
     except Exception as exc:
         logger.warning("ensemble_fetch_failed", city=city.key,
                        date=target_date, error=str(exc)[:200])
+        return None
+    if data is None:
+        # Rate-limited or backoff window — short-circuit silently; the
+        # rate-limit hit was already logged once.
         return None
 
     h = data.get("hourly") or {}
