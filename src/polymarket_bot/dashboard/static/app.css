@@ -206,6 +206,19 @@ th {
 tbody tr:hover { background: var(--surface-2); }
 td.pos { color: var(--accent-2); }
 td.neg { color: var(--danger); }
+td .pos { color: var(--accent-2); }
+td .neg { color: var(--danger); }
+
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--text); background: var(--surface-2); }
+
+td.empty, td.loading {
+  text-align: center;
+  color: var(--text-faint);
+  padding: 16px;
+  font-style: italic;
+}
+.table-wrap { width: 100%; overflow-x: auto; }
 
 /* uPlot dark adjustments */
 .uplot { color: var(--text-dim); }

@@ -131,26 +131,33 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
         return 200, s
 
     if path == "/api/fills":
-        limit = int(qs.get("limit", ["20"])[0])
-        rows = list_fills(limit=limit)
+        limit = int(qs.get("limit", ["50"])[0])
+        offset = int(qs.get("offset", ["0"])[0])
+        # Fetch one extra row to detect has_more without a COUNT(*) query.
+        rows = list_fills(limit=limit + 1, offset=offset)
+        has_more = len(rows) > limit
+        rows = rows[:limit]
         out = []
         for f in rows:
             d = _fill_dict(f)
             mm = get_market(f.market_id)
             d["title"] = mm.title if mm and mm.title else None
             out.append(d)
-        return 200, {"fills": out}
+        return 200, {"fills": out, "offset": offset, "has_more": has_more}
 
     if path == "/api/settlements":
         limit = int(qs.get("limit", ["50"])[0])
-        rows = list_settlements(limit=limit)
+        offset = int(qs.get("offset", ["0"])[0])
+        rows = list_settlements(limit=limit + 1, offset=offset)
+        has_more = len(rows) > limit
+        rows = rows[:limit]
         out = []
         for s in rows:
             d = _settlement_dict(s)
             mm = get_market(s.market_id)
             d["title"] = mm.title if mm and mm.title else None
             out.append(d)
-        return 200, {"settlements": out}
+        return 200, {"settlements": out, "offset": offset, "has_more": has_more}
 
     if path == "/api/strategies":
         return 200, {

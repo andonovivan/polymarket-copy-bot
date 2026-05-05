@@ -4,6 +4,11 @@
 // background refresh tick mutates only the data-bearing elements (textContent,
 // table tbody, uPlot.setData). The whole page never re-renders unless the user
 // navigates between routes.
+//
+// Tables are sortable everywhere and lazy-paginate on the dedicated Fills /
+// Settlements pages (IntersectionObserver on a sentinel row triggers the next
+// page fetch). The dashboard's compact tables are sortable but unpaginated —
+// they're bounded by current open positions and recent fills.
 (() => {
   const $ = (sel) => document.querySelector(sel);
   const fmtUsd = (n) => (n == null ? "—" : (n >= 0 ? "" : "-") + "$" + Math.abs(n).toFixed(2));
@@ -24,18 +29,250 @@
     if (klass != null && el.className !== klass) el.className = klass;
   }
 
-  // setHTML only writes when the body changed — kills the visible flicker on
-  // tables that get a tick where nothing changed. The cache lives on the
-  // element itself (one slot per element, not per cacheKey) so navigating
-  // away and back forces a re-render even when the new content matches what
-  // a *different* renderer wrote previously to the same element. cacheKey is
-  // accepted for back-compat but ignored.
-  function setHTMLIfChanged(el, html, _cacheKey) {
+  function setHTMLIfChanged(el, html) {
     if (!el) return;
     if (el.__lastHTML === html) return;
     el.innerHTML = html;
     el.__lastHTML = html;
   }
+
+  // ===========================================================================
+  // Table — sortable headers + optional lazy pagination via fetcher.
+  //
+  // Two modes:
+  //   data mode  — caller supplies rows via setRows(); refresh tick replaces.
+  //   fetcher mode — caller supplies async fetcher({offset, limit}); the table
+  //                  loads pages itself and lazy-loads more as the sentinel row
+  //                  becomes visible.
+  // ===========================================================================
+
+  class Table {
+    constructor(container, opts) {
+      this.container = container;
+      this.columns = opts.columns;
+      this.fetcher = opts.fetcher || null;
+      this.pageSize = opts.pageSize || 50;
+      this.emptyText = opts.emptyText || "No rows.";
+      this._rows = [];
+      this._sortKey = opts.initialSort && opts.initialSort.key || null;
+      this._sortDir = opts.initialSort && opts.initialSort.dir || "desc";
+      this._offset = 0;
+      this._hasMore = false;
+      this._loading = false;
+      this._initialFetched = !this.fetcher;   // data mode is "ready" immediately
+      this._observer = null;
+      this._render();
+      if (this.fetcher) this._loadMore();
+    }
+
+    setRows(rows) {
+      this._rows = rows.slice();
+      this._renderBody();
+    }
+
+    async _loadMore() {
+      if (!this.fetcher || this._loading) return;
+      if (this._offset > 0 && !this._hasMore) return;
+      this._loading = true;
+      try {
+        const res = await this.fetcher({ offset: this._offset, limit: this.pageSize });
+        const items = res.items || [];
+        if (this._offset === 0) this._rows = [];
+        this._rows = this._rows.concat(items);
+        this._hasMore = !!res.has_more;
+        this._offset += items.length;
+        this._initialFetched = true;
+        this._renderBody();
+      } catch (e) {
+        console.error("table fetch failed:", e);
+        this._initialFetched = true;
+        this._renderBody();
+      } finally {
+        this._loading = false;
+      }
+    }
+
+    _onSort(key) {
+      const col = this.columns.find((c) => c.key === key);
+      if (!col || col.sortable === false) return;
+      if (this._sortKey === key) {
+        this._sortDir = this._sortDir === "asc" ? "desc" : "asc";
+      } else {
+        this._sortKey = key;
+        this._sortDir = "desc";
+      }
+      this._renderHead();
+      this._renderBody();
+    }
+
+    _sortedRows() {
+      if (!this._sortKey) return this._rows;
+      const col = this.columns.find((c) => c.key === this._sortKey);
+      if (!col) return this._rows;
+      const get = col.sortKey || ((r) => r[col.key]);
+      const dir = this._sortDir === "asc" ? 1 : -1;
+      return this._rows.slice().sort((a, b) => {
+        const ka = get(a), kb = get(b);
+        if (ka == null && kb == null) return 0;
+        if (ka == null) return 1;
+        if (kb == null) return -1;
+        if (ka < kb) return -dir;
+        if (ka > kb) return dir;
+        return 0;
+      });
+    }
+
+    _renderHead() {
+      const ths = this.columns.map((c) => {
+        const sortable = c.sortable !== false;
+        const arrow = (this._sortKey === c.key)
+          ? (this._sortDir === "asc" ? " ▲" : " ▼")
+          : "";
+        const cls = sortable ? 'class="sortable"' : "";
+        const data = sortable ? ` data-sort-key="${c.key}"` : "";
+        return `<th ${cls}${data}>${c.label}${arrow}</th>`;
+      }).join("");
+      const html = `<tr>${ths}</tr>`;
+      if (this._thead.__lastHTML !== html) {
+        this._thead.innerHTML = html;
+        this._thead.__lastHTML = html;
+      }
+    }
+
+    _renderBody() {
+      let html;
+      if (this.fetcher && !this._initialFetched) {
+        html = `<tr><td colspan="${this.columns.length}" class="loading">Loading…</td></tr>`;
+      } else {
+        const rows = this._sortedRows();
+        if (rows.length === 0) {
+          html = `<tr><td colspan="${this.columns.length}" class="empty">${this.emptyText}</td></tr>`;
+        } else {
+          html = rows.map((row) => {
+            const tds = this.columns.map((c) => {
+              const v = c.format ? c.format(row) : (row[c.key] == null ? "" : String(row[c.key]));
+              return `<td>${v}</td>`;
+            }).join("");
+            return `<tr>${tds}</tr>`;
+          }).join("");
+          if (this.fetcher && this._hasMore) {
+            html += `<tr class="sentinel"><td colspan="${this.columns.length}" class="loading">Loading more…</td></tr>`;
+          }
+        }
+      }
+      if (this._tbody.__lastHTML !== html) {
+        this._tbody.innerHTML = html;
+        this._tbody.__lastHTML = html;
+      }
+      this._setupSentinel();
+    }
+
+    _setupSentinel() {
+      if (!this.fetcher) return;
+      if (this._observer) this._observer.disconnect();
+      const sentinel = this._tbody.querySelector("tr.sentinel");
+      if (!sentinel) return;
+      this._observer = new IntersectionObserver((entries) => {
+        if (entries.some((e) => e.isIntersecting)) this._loadMore();
+      }, { root: null, rootMargin: "300px", threshold: 0 });
+      this._observer.observe(sentinel);
+    }
+
+    _render() {
+      this.container.innerHTML = `
+        <div class="table-wrap">
+          <table>
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>`;
+      this._thead = this.container.querySelector("thead");
+      this._tbody = this.container.querySelector("tbody");
+      this._renderHead();
+      this._renderBody();
+      this._thead.addEventListener("click", (e) => {
+        const th = e.target.closest("th[data-sort-key]");
+        if (th) this._onSort(th.dataset.sortKey);
+      });
+    }
+  }
+
+  // ===========================================================================
+  // Column sets
+  // ===========================================================================
+
+  const titleCell = (r) =>
+    `<span title="${r.market_id || ""}">${r.title || (r.market_id || "").slice(0, 14) + "…"}</span>`;
+  const titleSort = (r) => (r.title || r.market_id || "").toLowerCase();
+
+  const INVENTORY_COLS = [
+    { key: "title",             label: "Market",      format: titleCell, sortKey: titleSort },
+    { key: "yes_shares",        label: "YES shares",  format: (r) => fmtNum(r.yes_shares, 2) },
+    { key: "avg_yes_cost",      label: "Avg cost",    format: (r) => fmtUsd(r.avg_yes_cost) },
+    { key: "current_yes_price", label: "Current YES", format: (r) => r.current_yes_price == null ? "—" : fmtUsd(r.current_yes_price) },
+    { key: "cost",              label: "Cost",        format: (r) => fmtUsd(r.cost) },
+    { key: "mtm_value",         label: "MTM value",   format: (r) => r.mtm_value == null ? "—" : fmtUsd(r.mtm_value) },
+    {
+      key: "unrealized_pnl", label: "Unrealized",
+      format: (r) => {
+        if (r.unrealized_pnl == null) return "—";
+        const cls = r.unrealized_pnl > 0 ? "pos" : r.unrealized_pnl < 0 ? "neg" : "";
+        return `<span class="${cls}">${fmtUsd(r.unrealized_pnl)}</span>`;
+      },
+    },
+  ];
+
+  const ORDER_COLS = [
+    { key: "placed_at",  label: "Placed", format: (r) => fmtTs(r.placed_at) },
+    { key: "title",      label: "Market", format: titleCell, sortKey: titleSort },
+    { key: "token_side", label: "Token",  format: (r) => r.token_side },
+    { key: "side",       label: "Side",   format: (r) => r.side },
+    { key: "price",      label: "Price",  format: (r) => fmtNum(r.price, 3) },
+    { key: "size",       label: "Size",   format: (r) => fmtNum(r.size, 2) },
+    { key: "filled",     label: "Filled", format: (r) => fmtNum(r.filled, 2) },
+  ];
+
+  const FILL_COLS = [
+    { key: "fill_ts",    label: "Filled", format: (r) => fmtTs(r.fill_ts) },
+    { key: "title",      label: "Market", format: titleCell, sortKey: titleSort },
+    { key: "token_side", label: "Token",  format: (r) => r.token_side },
+    { key: "side",       label: "Side",   format: (r) => r.side },
+    { key: "price",      label: "Price",  format: (r) => fmtNum(r.price, 3) },
+    { key: "size",       label: "Size",   format: (r) => fmtNum(r.size, 2) },
+    {
+      key: "notional", label: "Notional",
+      format: (r) => fmtUsd(r.size * r.price),
+      sortKey: (r) => r.size * r.price,
+    },
+  ];
+
+  const SETTLEMENT_COLS = [
+    { key: "settled_at",   label: "Settled", format: (r) => fmtTs(r.settled_at) },
+    { key: "title",        label: "Market",  format: titleCell, sortKey: titleSort },
+    { key: "outcome",      label: "Outcome", format: (r) => r.outcome },
+    { key: "yes_shares",   label: "YES",     format: (r) => fmtNum(r.yes_shares, 2) },
+    { key: "avg_yes_cost", label: "Avg YES", format: (r) => fmtUsd(r.avg_yes_cost) },
+    { key: "no_shares",    label: "NO",      format: (r) => fmtNum(r.no_shares, 2) },
+    { key: "avg_no_cost",  label: "Avg NO",  format: (r) => fmtUsd(r.avg_no_cost) },
+    { key: "cost",         label: "Cost",    format: (r) => fmtUsd(r.cost) },
+    { key: "payout",       label: "Payout",  format: (r) => fmtUsd(r.payout) },
+    {
+      key: "pnl", label: "PnL",
+      format: (r) => {
+        const cls = r.pnl > 0 ? "pos" : r.pnl < 0 ? "neg" : "";
+        return `<span class="${cls}">${fmtUsd(r.pnl)}</span>`;
+      },
+    },
+  ];
+
+  const STRATEGY_COLS = [
+    { key: "name",    label: "Name",    format: (r) => r.name },
+    { key: "enabled", label: "Enabled", format: (r) => (r.enabled ? "✓" : "") },
+  ];
+
+  // ===========================================================================
+  // Header refresh
+  // ===========================================================================
 
   async function refreshHeader() {
     try {
@@ -56,11 +293,14 @@
   }
 
   // ===========================================================================
-  // Dashboard — skeleton + surgical data updates
+  // Dashboard — skeleton + Table instances reused across refresh ticks
   // ===========================================================================
 
   let _dashboardBuilt = false;
   let _equityChart = null;
+  let _invTable = null;
+  let _ordersTable = null;
+  let _dashFillsTable = null;
 
   function buildDashboardSkeleton() {
     $("#page").innerHTML = `
@@ -86,7 +326,22 @@
         <h2 class="section-title">Recent fills</h2>
         <div id="fills"></div>
       </div>`;
-    _equityChart = null;   // reset; will be created on first refresh that has data
+    _equityChart = null;
+    _invTable = new Table($("#inventory"), {
+      columns: INVENTORY_COLS,
+      emptyText: "Flat — no open positions.",
+      initialSort: { key: "unrealized_pnl", dir: "desc" },
+    });
+    _ordersTable = new Table($("#open-orders"), {
+      columns: ORDER_COLS,
+      emptyText: "No open orders.",
+      initialSort: { key: "placed_at", dir: "desc" },
+    });
+    _dashFillsTable = new Table($("#fills"), {
+      columns: FILL_COLS,
+      emptyText: "No fills yet.",
+      initialSort: { key: "fill_ts", dir: "desc" },
+    });
   }
 
   async function refreshDashboardData() {
@@ -97,7 +352,6 @@
       api("/api/fills?limit=15").catch(() => ({ fills: [] })),
     ]);
 
-    // Cards.
     setText("#m-equity", fmtUsd(stats.latest_equity));
 
     const unreal = position.totals?.unrealized_pnl;
@@ -115,7 +369,6 @@
     setText("#m-positions", String(position.inventories?.length ?? 0));
     setText("#m-positions-sub", `+ ${position.open_orders?.length ?? 0} open orders`);
 
-    // Equity chart — keep the uPlot instance alive, just .setData on refresh.
     const pts = curve.points || [];
     const xs = pts.map((p) => p.ts);
     const ys = pts.map((p) => p.equity);
@@ -133,69 +386,12 @@
         _equityChart.setData([xs, ys]);
       }
     } else if (!_equityChart) {
-      setHTMLIfChanged(chartEl, '<div class="empty">No equity data yet.</div>', "empty");
+      setHTMLIfChanged(chartEl, '<div class="empty">No equity data yet.</div>');
     }
 
-    // Inventory.
-    const invs = (position.inventories || []).slice().sort(
-      (a, b) => (b.unrealized_pnl ?? 0) - (a.unrealized_pnl ?? 0)
-    );
-    setHTMLIfChanged($("#inventory"), invs.length ? `
-      <table>
-        <thead><tr>
-          <th>Market</th><th>YES shares</th><th>Avg cost</th>
-          <th>Current YES</th><th>Cost</th><th>MTM value</th><th>Unrealized</th>
-        </tr></thead>
-        <tbody>
-          ${invs.map((i) => {
-            const title = i.title || ((i.market_id || "").slice(0, 14) + "…");
-            const cls = i.unrealized_pnl > 0 ? "pos" : i.unrealized_pnl < 0 ? "neg" : "";
-            return `<tr>
-              <td title="${i.market_id}">${title}</td>
-              <td>${fmtNum(i.yes_shares, 2)}</td>
-              <td>${fmtUsd(i.avg_yes_cost)}</td>
-              <td>${i.current_yes_price == null ? "—" : fmtUsd(i.current_yes_price)}</td>
-              <td>${fmtUsd(i.cost)}</td>
-              <td>${i.mtm_value == null ? "—" : fmtUsd(i.mtm_value)}</td>
-              <td class="${cls}">${i.unrealized_pnl == null ? "—" : fmtUsd(i.unrealized_pnl)}</td>
-            </tr>`;
-          }).join("")}
-        </tbody>
-      </table>` : '<div class="empty">Flat — no open positions.</div>',
-    "inv");
-
-    // Open orders.
-    const orders = position.open_orders || [];
-    setHTMLIfChanged($("#open-orders"), orders.length ? `
-      <table>
-        <thead><tr><th>Placed</th><th>Market</th><th>Token</th><th>Side</th><th>Price</th><th>Size</th><th>Filled</th></tr></thead>
-        <tbody>
-          ${orders.map((o) => `<tr>
-            <td>${fmtTs(o.placed_at)}</td>
-            <td title="${o.market_id}">${o.title || (o.market_id || "").slice(0, 14) + "…"}</td>
-            <td>${o.token_side}</td><td>${o.side}</td>
-            <td>${fmtNum(o.price, 3)}</td><td>${fmtNum(o.size, 2)}</td><td>${fmtNum(o.filled, 2)}</td>
-          </tr>`).join("")}
-        </tbody>
-      </table>` : '<div class="empty">No open orders.</div>',
-    "ord");
-
-    // Recent fills.
-    const filled = fills.fills || [];
-    setHTMLIfChanged($("#fills"), filled.length ? `
-      <table>
-        <thead><tr><th>Filled</th><th>Market</th><th>Token</th><th>Side</th><th>Price</th><th>Size</th><th>Notional</th></tr></thead>
-        <tbody>
-          ${filled.map((f) => `<tr>
-            <td>${fmtTs(f.fill_ts)}</td>
-            <td title="${f.market_id}">${f.title || (f.market_id || "").slice(0, 14) + "…"}</td>
-            <td>${f.token_side}</td><td>${f.side}</td>
-            <td>${fmtNum(f.price, 3)}</td><td>${fmtNum(f.size, 2)}</td>
-            <td>${fmtUsd(f.size * f.price)}</td>
-          </tr>`).join("")}
-        </tbody>
-      </table>` : '<div class="empty">No fills yet.</div>',
-    "fills");
+    if (_invTable) _invTable.setRows(position.inventories || []);
+    if (_ordersTable) _ordersTable.setRows(position.open_orders || []);
+    if (_dashFillsTable) _dashFillsTable.setRows(fills.fills || []);
   }
 
   async function pageDashboard() {
@@ -208,73 +404,48 @@
   }
 
   // ===========================================================================
-  // Other pages — full re-render on entry, refresh in place via setHTMLIfChanged
+  // Standalone pages — paginated tables build a fresh Table on entry.
   // ===========================================================================
 
-  async function pageFills() {
+  function pageFills() {
     setText("#page-title", "Fills");
-    const data = await api("/api/fills?limit=500").catch(() => ({ fills: [] }));
-    const filled = data.fills || [];
-    const pageEl = $("#page");
-    if (!filled.length) {
-      setHTMLIfChanged(pageEl, '<div class="placeholder">No fills yet.</div>', "fillsPage");
-      return;
-    }
-    setHTMLIfChanged(pageEl, `
-      <div class="section">
-        <table>
-          <thead><tr><th>Filled</th><th>Market</th><th>Token</th><th>Side</th><th>Price</th><th>Size</th><th>Notional</th></tr></thead>
-          <tbody>
-            ${filled.map((f) => `<tr>
-              <td>${fmtTs(f.fill_ts)}</td>
-              <td title="${f.market_id}">${f.title || (f.market_id || "").slice(0, 14) + "…"}</td>
-              <td>${f.token_side}</td><td>${f.side}</td>
-              <td>${fmtNum(f.price, 3)}</td><td>${fmtNum(f.size, 2)}</td>
-              <td>${fmtUsd(f.size * f.price)}</td>
-            </tr>`).join("")}
-          </tbody>
-        </table>
-      </div>`, "fillsPage");
+    $("#page").innerHTML = `<div class="section"><div id="fills-table"></div></div>`;
+    new Table($("#fills-table"), {
+      columns: FILL_COLS,
+      pageSize: 50,
+      fetcher: ({ offset, limit }) =>
+        api(`/api/fills?limit=${limit}&offset=${offset}`).then((r) => ({
+          items: r.fills || [], has_more: !!r.has_more,
+        })),
+      emptyText: "No fills yet.",
+      initialSort: { key: "fill_ts", dir: "desc" },
+    });
   }
 
-  async function pageSettlements() {
+  function pageSettlements() {
     setText("#page-title", "Settlements");
-    const data = await api("/api/settlements?limit=200").catch(() => ({ settlements: [] }));
-    const ss = data.settlements || [];
-    const pageEl = $("#page");
-    if (!ss.length) {
-      setHTMLIfChanged(pageEl, '<div class="placeholder">No settled markets yet.</div>', "settPage");
-      return;
-    }
-    setHTMLIfChanged(pageEl, `
-      <div class="section">
-        <table>
-          <thead><tr><th>Settled</th><th>Market</th><th>Outcome</th><th>YES</th><th>Avg YES</th><th>NO</th><th>Avg NO</th><th>Cost</th><th>Payout</th><th>PnL</th></tr></thead>
-          <tbody>
-            ${ss.map((s) => `<tr>
-              <td>${fmtTs(s.settled_at)}</td>
-              <td title="${s.market_id}">${s.title || (s.market_id || "").slice(0, 14) + "…"}</td>
-              <td>${s.outcome}</td>
-              <td>${fmtNum(s.yes_shares, 2)}</td><td>${fmtUsd(s.avg_yes_cost)}</td>
-              <td>${fmtNum(s.no_shares, 2)}</td><td>${fmtUsd(s.avg_no_cost)}</td>
-              <td>${fmtUsd(s.cost)}</td><td>${fmtUsd(s.payout)}</td>
-              <td class="${s.pnl > 0 ? 'pos' : s.pnl < 0 ? 'neg' : ''}">${fmtUsd(s.pnl)}</td>
-            </tr>`).join("")}
-          </tbody>
-        </table>
-      </div>`, "settPage");
+    $("#page").innerHTML = `<div class="section"><div id="settlements-table"></div></div>`;
+    new Table($("#settlements-table"), {
+      columns: SETTLEMENT_COLS,
+      pageSize: 50,
+      fetcher: ({ offset, limit }) =>
+        api(`/api/settlements?limit=${limit}&offset=${offset}`).then((r) => ({
+          items: r.settlements || [], has_more: !!r.has_more,
+        })),
+      emptyText: "No settled markets yet.",
+      initialSort: { key: "settled_at", dir: "desc" },
+    });
   }
 
   async function pageStrategies() {
     setText("#page-title", "Strategies");
+    $("#page").innerHTML = `<div class="section"><div id="strategies-table"></div></div>`;
     const data = await api("/api/strategies").catch(() => ({ strategies: [] }));
-    setHTMLIfChanged($("#page"), `
-      <div class="section">
-        <table>
-          <thead><tr><th>Name</th><th>Enabled</th></tr></thead>
-          <tbody>${data.strategies.map((s) => `<tr><td>${s.name}</td><td>${s.enabled ? "✓" : ""}</td></tr>`).join("")}</tbody>
-        </table>
-      </div>`, "stratPage");
+    new Table($("#strategies-table"), {
+      columns: STRATEGY_COLS,
+      emptyText: "No strategies registered.",
+      initialSort: { key: "enabled", dir: "desc" },
+    }).setRows(data.strategies || []);
   }
 
   async function pageSettings() {
@@ -289,24 +460,25 @@
         <p style="color: var(--text-faint); font-size: 12px; margin-top: 14px;">
           Edit <code>.env</code> and restart the bot to apply.
         </p>
-      </div>`, "settingsPage");
+      </div>`);
   }
 
   async function pageLogs() {
     setText("#page-title", "Logs");
     setHTMLIfChanged($("#page"),
-      '<div class="placeholder">Log streaming not yet wired. Tail <code>docker compose logs -f bot</code> instead.</div>',
-      "logsPage");
+      '<div class="placeholder">Log streaming not yet wired. Tail <code>docker compose logs -f bot</code> instead.</div>');
   }
 
   // ===========================================================================
   // Routing + lifecycle
   // ===========================================================================
 
+  // Paginated pages skip auto-refresh — re-entering them via the navbar is the
+  // refresh action. Avoids merging new rows into the user's scroll position.
   const ROUTES = {
     dashboard:   { enter: pageDashboard,    refresh: refreshDashboardData },
-    fills:       { enter: pageFills,        refresh: pageFills            },
-    settlements: { enter: pageSettlements,  refresh: pageSettlements      },
+    fills:       { enter: pageFills,        refresh: null                 },
+    settlements: { enter: pageSettlements,  refresh: null                 },
     strategies:  { enter: pageStrategies,   refresh: pageStrategies       },
     settings:    { enter: pageSettings,     refresh: null                 },
     logs:        { enter: pageLogs,         refresh: null                 },
@@ -324,7 +496,6 @@
     const hash = location.hash || "#/dashboard";
     const name = (hash.replace(/^#\//, "").split("?")[0]) || "dashboard";
     const route = ROUTES[name] || ROUTES.dashboard;
-    // Switching pages destroys the previous skeleton; reset the dashboard flag.
     if (name !== "dashboard") _dashboardBuilt = false;
     _activeRoute = name;
     setActiveNav(name);
@@ -349,5 +520,5 @@
   refreshHeader();
   navigate();
   setInterval(refreshHeader, 5000);
-  setInterval(refreshActive, 10000);   // background data tick — no full re-render
+  setInterval(refreshActive, 10000);
 })();

@@ -345,14 +345,14 @@ def insert_settlement(s: Settlement) -> None:
         conn.commit()
 
 
-def list_settlements(limit: int = 100) -> list[Settlement]:
+def list_settlements(limit: int = 100, offset: int = 0) -> list[Settlement]:
     conn = get_conn()
     with lock():
         rows = conn.execute(
             "SELECT market_id, settled_at, outcome, yes_shares, no_shares, "
             "avg_yes_cost, avg_no_cost, payout, cost, pnl, strategy "
-            "FROM settlements ORDER BY settled_at DESC LIMIT ?",
-            (limit,),
+            "FROM settlements ORDER BY settled_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         ).fetchall()
     return [Settlement(*r) for r in rows]
 
