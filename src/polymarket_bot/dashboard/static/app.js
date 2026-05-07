@@ -319,9 +319,10 @@
 
   let _dashboardBuilt = false;
   let _equityChart = null;
+  let _dailyPnlChart = null;
+  let _winRateChart = null;
   let _invTable = null;
   let _ordersTable = null;
-  let _dashFillsTable = null;
   // Tables on standalone pages — destroyed and recreated when the user
   // navigates between routes. Tracking them lets us release the
   // IntersectionObserver on tear-down and preserve sort state when a
@@ -349,6 +350,26 @@
         <h2 class="section-title">Equity curve</h2>
         <div id="equity-chart" style="height: 280px;"></div>
       </div>
+      <div class="charts-row">
+        <div class="section section-half">
+          <h2 class="section-title">Daily P&L (last 30d)</h2>
+          <div id="daily-pnl-chart" style="height: 200px;"></div>
+        </div>
+        <div class="section section-half">
+          <h2 class="section-title">Win rate (last 30d)</h2>
+          <div id="winrate-chart" style="height: 200px;"></div>
+        </div>
+      </div>
+      <div class="charts-row">
+        <div class="section section-half">
+          <h2 class="section-title">Inventory by city</h2>
+          <div id="inventory-by-city" class="bar-list"></div>
+        </div>
+        <div class="section section-half">
+          <h2 class="section-title">P&L by strategy</h2>
+          <div id="strategy-pnl" class="bar-list"></div>
+        </div>
+      </div>
       <div class="section">
         <h2 class="section-title">Current inventory</h2>
         <div id="inventory"></div>
@@ -356,12 +377,10 @@
       <div class="section">
         <h2 class="section-title">Open orders</h2>
         <div id="open-orders"></div>
-      </div>
-      <div class="section">
-        <h2 class="section-title">Recent fills</h2>
-        <div id="fills"></div>
       </div>`;
     _equityChart = null;
+    _dailyPnlChart = null;
+    _winRateChart = null;
     _invTable = new Table($("#inventory"), {
       columns: INVENTORY_COLS,
       emptyText: "Flat — no open positions.",
@@ -372,28 +391,101 @@
       emptyText: "No open orders.",
       initialSort: { key: "placed_at", dir: "desc" },
     });
-    _dashFillsTable = new Table($("#fills"), {
-      columns: FILL_COLS,
-      emptyText: "No fills yet.",
-      initialSort: { key: "fill_ts", dir: "desc" },
-    });
   }
 
+  // ---------- chart helpers ----------
+
+  // Reusable uPlot factory: pass the container, dataset and series spec.
+  // Returns the chart instance — caller stashes it and uses .setData() on
+  // subsequent ticks.
+  function _makeChart(container, data, opts) {
+    if (!window.uPlot) return null;
+    container.innerHTML = "";
+    const cfg = {
+      width: container.clientWidth,
+      height: opts.height || 200,
+      scales: opts.scales || { x: { time: false } },
+      series: opts.series,
+      axes: opts.axes || [{ stroke: "#6b6f7a" }, { stroke: "#6b6f7a" }],
+      legend: { show: false },
+    };
+    return new window.uPlot(cfg, data, container);
+  }
+
+  // Bar-paths factory for uPlot — emulates a vertical bar chart with a line
+  // series (uPlot has no native bars on this version). Returns a paths fn.
+  function _barPaths(width = 0.7) {
+    return (u, seriesIdx) => {
+      const path = new Path2D();
+      const xs = u.data[0];
+      const ys = u.data[seriesIdx];
+      const zeroY = u.valToPos(0, "y", true);
+      for (let i = 0; i < xs.length; i++) {
+        const v = ys[i];
+        if (v == null) continue;
+        const xPx = u.valToPos(xs[i], "x", true);
+        const yPx = u.valToPos(v, "y", true);
+        const halfW = (u.bbox.width / xs.length) * width / 2;
+        const top = Math.min(zeroY, yPx);
+        const h = Math.abs(zeroY - yPx);
+        path.rect(xPx - halfW, top, halfW * 2, h);
+      }
+      return { fill: path };
+    };
+  }
+
+  // Render a list of {label, primary, secondary, pnl, color_from} bars into
+  // a `<div class="bar-list">` container. Used for Inventory-by-city and
+  // PnL-by-strategy. Pure HTML/CSS — no chart library.
+  function _renderBarList(container, rows, opts) {
+    if (!rows || rows.length === 0) {
+      setHTMLIfChanged(container, '<div class="empty">' + (opts.emptyText || "No data.") + '</div>');
+      return;
+    }
+    const maxAbs = Math.max(...rows.map((r) => Math.abs(r.barValue || 0)), 1e-9);
+    const html = rows.map((r) => {
+      const pct = (Math.abs(r.barValue || 0) / maxAbs) * 100;
+      const cls = r.barValue > 0 ? "pos" : r.barValue < 0 ? "neg" : "";
+      return `<div class="bar-row">
+        <div class="bar-row-label">${esc(r.label)}</div>
+        <div class="bar-row-track">
+          <div class="bar-row-fill ${cls}" style="width: ${pct.toFixed(1)}%"></div>
+        </div>
+        <div class="bar-row-value">${esc(r.valueText || "")}</div>
+      </div>`;
+    }).join("");
+    setHTMLIfChanged(container, html);
+  }
+
+  // Parse the city out of a bucket title like "Paris · May 7 · 14°C".
+  function _cityFromTitle(title) {
+    if (!title) return "?";
+    const i = title.indexOf("·");
+    return (i >= 0 ? title.slice(0, i) : title).trim();
+  }
+
+  // ---------- main refresh ----------
+
   async function refreshDashboardData() {
-    const [stats, curve, position, fills] = await Promise.all([
-      api("/api/stats/today").catch(() => ({})),
-      api("/api/equity-curve").catch(() => ({ points: [] })),
-      api("/api/position").catch(() => ({ open_orders: [], inventories: [], totals: {} })),
-      api("/api/fills?limit=15").catch(() => ({ fills: [] })),
-    ]);
+    // Single bundled fetch replacing the 4 parallel calls of the old
+    // implementation. See dashboard/api.py:dispatch_get("/api/dashboard").
+    const data = await api("/api/dashboard").catch(() => ({
+      stats_today: {}, totals: {}, inventories: [], open_orders: [],
+      equity_curve: [], daily_pnl: [], strategy_pnl: [],
+    }));
+
+    const stats = data.stats_today || {};
+    const totals = data.totals || {};
+
+    // ---- cards ----
 
     setText("#m-equity", fmtUsd(stats.latest_equity));
 
-    const unreal = position.totals?.unrealized_pnl;
+    const unreal = totals.unrealized_pnl;
     const unrealCls = "value " + (unreal > 0 ? "pos" : unreal < 0 ? "neg" : "");
     setText("#m-unreal", unreal == null ? "—" : fmtUsd(unreal), unrealCls);
-    setText("#m-unreal-sub", position.totals?.cost
-      ? `cost ${fmtUsd(position.totals.cost)} · mtm ${fmtUsd(position.totals.mtm_value)}`
+    setText("#m-unreal-sub", totals.cost
+      ? `cost ${fmtUsd(totals.cost)} · mtm ${fmtUsd(totals.mtm_value)}`
       : "—");
 
     const pnlCls = "value " + (stats.pnl > 0 ? "pos" : stats.pnl < 0 ? "neg" : "");
@@ -401,32 +493,128 @@
     setText("#m-pnl-sub",
       `${stats.settlements ?? 0} settled · ${stats.wins ?? 0}W / ${(stats.settlements ?? 0) - (stats.wins ?? 0)}L · win rate ${fmtPct(stats.win_rate)}`);
 
-    setText("#m-positions", String(position.inventories?.length ?? 0));
-    setText("#m-positions-sub", `+ ${position.open_orders?.length ?? 0} open orders`);
+    setText("#m-positions", String(data.inventories?.length ?? 0));
+    setText("#m-positions-sub", `+ ${data.open_orders?.length ?? 0} open orders`);
 
-    const pts = curve.points || [];
+    // ---- equity curve ----
+    const pts = data.equity_curve || [];
     const xs = pts.map((p) => p.ts);
     const ys = pts.map((p) => p.equity);
-    const chartEl = $("#equity-chart");
-    if (xs.length > 1 && window.uPlot) {
+    const equityEl = $("#equity-chart");
+    if (xs.length > 1) {
       if (!_equityChart) {
-        chartEl.innerHTML = "";
-        _equityChart = new window.uPlot({
-          width: chartEl.clientWidth, height: 260,
+        _equityChart = _makeChart(equityEl, [xs, ys], {
+          height: 260,
           scales: { x: { time: true } },
-          series: [{}, { stroke: "rgb(110,168,255)", width: 1.5, fill: "rgba(110,168,255,0.08)" }],
-          axes: [{ stroke: "#6b6f7a" }, { stroke: "#6b6f7a" }],
-        }, [xs, ys], chartEl);
+          series: [{}, {
+            stroke: "rgb(110,168,255)", width: 1.5,
+            fill: "rgba(110,168,255,0.08)",
+          }],
+        });
       } else {
         _equityChart.setData([xs, ys]);
       }
     } else if (!_equityChart) {
-      setHTMLIfChanged(chartEl, '<div class="empty">No equity data yet.</div>');
+      setHTMLIfChanged(equityEl, '<div class="empty">No equity data yet.</div>');
     }
 
-    if (_invTable) _invTable.setRows(position.inventories || []);
-    if (_ordersTable) _ordersTable.setRows(position.open_orders || []);
-    if (_dashFillsTable) _dashFillsTable.setRows(fills.fills || []);
+    // ---- daily P&L bar chart ----
+    // Two parallel series — one for positive bars, one for negative bars,
+    // each with its own color. uPlot's per-series `fill` cannot color
+    // individual bars within a single series, so this is the cleanest way
+    // to get per-bar green/red without custom drawing.
+    const daily = data.daily_pnl || [];
+    const dailyEl = $("#daily-pnl-chart");
+    if (daily.length > 0) {
+      const dayIdx = daily.map((_, i) => i);
+      const positives = daily.map((d) => (d.pnl >= 0 ? d.pnl : null));
+      const negatives = daily.map((d) => (d.pnl < 0 ? d.pnl : null));
+      if (!_dailyPnlChart) {
+        _dailyPnlChart = _makeChart(dailyEl, [dayIdx, positives, negatives], {
+          height: 180,
+          scales: { x: { time: false } },
+          series: [
+            {},
+            { stroke: "transparent", width: 0,
+              fill: "rgba(72,187,120,0.55)", paths: _barPaths(0.7) },
+            { stroke: "transparent", width: 0,
+              fill: "rgba(255,107,107,0.55)", paths: _barPaths(0.7) },
+          ],
+        });
+      } else {
+        _dailyPnlChart.setData([dayIdx, positives, negatives]);
+      }
+    } else if (!_dailyPnlChart) {
+      setHTMLIfChanged(dailyEl, '<div class="empty">No settlements yet.</div>');
+    }
+
+    // ---- win rate sparkline ----
+    const winRateEl = $("#winrate-chart");
+    if (daily.length > 1) {
+      const idx = daily.map((_, i) => i);
+      const rates = daily.map((d) =>
+        d.n_settlements > 0 ? d.n_wins / d.n_settlements : null);
+      if (!_winRateChart) {
+        _winRateChart = _makeChart(winRateEl, [idx, rates], {
+          height: 180,
+          scales: { x: { time: false }, y: { range: [0, 1] } },
+          series: [{}, {
+            stroke: "rgb(187,134,252)", width: 1.5,
+            fill: "rgba(187,134,252,0.08)",
+          }],
+        });
+      } else {
+        _winRateChart.setData([idx, rates]);
+      }
+    } else if (!_winRateChart) {
+      setHTMLIfChanged(winRateEl,
+        '<div class="empty">Need ≥2 days of settlements.</div>');
+    }
+
+    // ---- inventory by city ----
+    // Track priced cost separately from total cost, so a city with no live
+    // quotes shows "—" for unrealized rather than a phantom -$cost loss.
+    const invByCity = {};
+    for (const inv of (data.inventories || [])) {
+      const city = _cityFromTitle(inv.title);
+      if (!invByCity[city]) {
+        invByCity[city] = { cost: 0, priced_cost: 0, mtm: 0, n: 0 };
+      }
+      invByCity[city].cost += inv.cost || 0;
+      invByCity[city].n += 1;
+      if (inv.mtm_value != null) {
+        invByCity[city].priced_cost += inv.cost || 0;
+        invByCity[city].mtm += inv.mtm_value;
+      }
+    }
+    const cityRows = Object.entries(invByCity)
+      .sort((a, b) => b[1].cost - a[1].cost)
+      .map(([city, agg]) => {
+        const upnl = agg.priced_cost > 0 ? agg.mtm - agg.priced_cost : null;
+        const upnlText = upnl == null
+          ? "—"
+          : (upnl >= 0 ? "+" : "") + fmtUsd(upnl);
+        return {
+          label: `${city} (${agg.n})`,
+          barValue: agg.cost,
+          valueText: `${fmtUsd(agg.cost)} · ${upnlText}`,
+        };
+      });
+    _renderBarList($("#inventory-by-city"), cityRows,
+      { emptyText: "Flat — no positions." });
+
+    // ---- P&L by strategy ----
+    const stratRows = (data.strategy_pnl || []).map((s) => ({
+      label: `${s.strategy} (${s.n_settlements})`,
+      barValue: s.pnl,
+      valueText: `${s.pnl >= 0 ? "+" : ""}${fmtUsd(s.pnl)} · ${s.n_wins}W`,
+    }));
+    _renderBarList($("#strategy-pnl"), stratRows,
+      { emptyText: "No settlements yet." });
+
+    // ---- existing tables ----
+    if (_invTable) _invTable.setRows(data.inventories || []);
+    if (_ordersTable) _ordersTable.setRows(data.open_orders || []);
   }
 
   async function pageDashboard() {
@@ -563,6 +751,10 @@
   window.addEventListener("hashchange", navigate);
   refreshHeader();
   navigate();
+  // Header refresh stays at 5s (cheap status/version ping).
+  // Active-page refresh at 15s — matches the bot's tick_seconds. The
+  // dashboard now uses a single bundled `/api/dashboard` call, so this
+  // is one request per cycle (was 4 every 10s).
   setInterval(refreshHeader, 5000);
-  setInterval(refreshActive, 10000);
+  setInterval(refreshActive, 15000);
 })();

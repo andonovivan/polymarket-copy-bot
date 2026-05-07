@@ -220,6 +220,46 @@ td.empty, td.loading {
 }
 .table-wrap { width: 100%; overflow-x: auto; }
 
+/* Two-column row of half-width sections used for paired charts on the
+   dashboard. Stacks vertically below 720px (matches the existing sidebar
+   collapse breakpoint). */
+.charts-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.section-half { margin-bottom: 0; }
+@media (max-width: 720px) {
+  .charts-row { grid-template-columns: 1fr; }
+}
+
+/* Horizontal-bar list used for Inventory-by-city and PnL-by-strategy. */
+.bar-list { display: flex; flex-direction: column; gap: 6px; padding: 4px 0; }
+.bar-row {
+  display: grid;
+  grid-template-columns: 130px 1fr 140px;
+  gap: 10px;
+  align-items: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.bar-row-label { color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar-row-track {
+  height: 10px;
+  background: var(--bg-alt);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.bar-row-fill {
+  height: 100%;
+  background: rgba(110, 168, 255, 0.55);
+  transition: width 0.25s ease;
+}
+.bar-row-fill.pos { background: rgba(72, 187, 120, 0.55); }
+.bar-row-fill.neg { background: rgba(255, 107, 107, 0.55); }
+.bar-row-value { color: var(--text); text-align: right; }
+
 /* uPlot dark adjustments */
 .uplot { color: var(--text-dim); }
 .u-axis text { fill: var(--text-faint) !important; }

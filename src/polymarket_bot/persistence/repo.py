@@ -155,6 +155,25 @@ def get_market(market_id: str) -> Market | None:
     return Market(*row) if row else None
 
 
+def markets_bulk(market_ids: list[str]) -> dict[str, Market]:
+    """Single SELECT for many market_ids — replaces N+1 `get_market` loops.
+
+    Returns a dict keyed by market_id; missing ids are simply absent.
+    """
+    if not market_ids:
+        return {}
+    conn = get_conn()
+    placeholders = ",".join("?" * len(market_ids))
+    with lock():
+        rows = conn.execute(
+            f"SELECT market_id, slug, resolution_ts, yes_token_id, no_token_id, outcome, "
+            f"bar_open, bar_close, title, last_yes_bid, last_yes_ask, last_yes_mid, last_quote_ts "
+            f"FROM markets WHERE market_id IN ({placeholders})",
+            tuple(market_ids),
+        ).fetchall()
+    return {r[0]: Market(*r) for r in rows}
+
+
 def settle_market_row(market_id: str, outcome: str, bar_open: float, bar_close: float) -> None:
     conn = get_conn()
     with lock():
@@ -308,9 +327,15 @@ def inventory_for_market(market_id: str) -> tuple[float, float, float, float]:
             "FROM fills WHERE market_id=? GROUP BY token_side, side",
             (market_id,),
         ).fetchall()
+    return _aggregate_inventory_rows(rows)
+
+
+def _aggregate_inventory_rows(rows) -> tuple[float, float, float, float]:
+    """Reduce a fills aggregation to (yes_shares, no_shares, avg_yes, avg_no)."""
     yes_buy_size = yes_buy_notional = yes_sell_size = 0.0
     no_buy_size = no_buy_notional = no_sell_size = 0.0
-    for token, side, total_size, total_notional in rows:
+    for row in rows:
+        token, side, total_size, total_notional = row[-4:]
         if token == "YES" and side == "BUY":
             yes_buy_size, yes_buy_notional = float(total_size), float(total_notional)
         elif token == "YES" and side == "SELL":
@@ -324,6 +349,33 @@ def inventory_for_market(market_id: str) -> tuple[float, float, float, float]:
     avg_yes = (yes_buy_notional / yes_buy_size) if yes_buy_size > 0 else 0.0
     avg_no = (no_buy_notional / no_buy_size) if no_buy_size > 0 else 0.0
     return yes_shares, no_shares, avg_yes, avg_no
+
+
+def inventory_snapshot(market_ids: list[str]) -> dict[str, tuple[float, float, float, float]]:
+    """Bulk inventory for many markets in a single SQL pass.
+
+    Returns dict {market_id → (yes_shares, no_shares, avg_yes, avg_no)}. Empty
+    list → empty dict. Missing markets are absent (no zero-fill); callers
+    should default with `dict.get(mid, (0, 0, 0, 0))`.
+
+    Replaces N+1 chains of `inventory_for_market` calls in the tick loop and
+    dashboard endpoints.
+    """
+    if not market_ids:
+        return {}
+    conn = get_conn()
+    placeholders = ",".join("?" * len(market_ids))
+    with lock():
+        rows = conn.execute(
+            f"SELECT market_id, token_side, side, SUM(size), SUM(size*price) "
+            f"FROM fills WHERE market_id IN ({placeholders}) "
+            f"GROUP BY market_id, token_side, side",
+            tuple(market_ids),
+        ).fetchall()
+    grouped: dict[str, list] = {}
+    for r in rows:
+        grouped.setdefault(r[0], []).append(r)
+    return {mid: _aggregate_inventory_rows(rs) for mid, rs in grouped.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +426,55 @@ def settlement_stats(from_ts: int | None = None, to_ts: int | None = None) -> di
         "wins": int(wins or 0),
         "win_rate": (float(wins or 0) / n) if n else 0.0,
     }
+
+
+def daily_pnl_summary(days: int = 30) -> list[dict[str, Any]]:
+    """Per-day rollup of settlements over the last `days` days.
+
+    Used by the dashboard's Daily PnL bar chart and the Win-rate sparkline.
+    Days with zero settlements simply don't appear in the result.
+    """
+    conn = get_conn()
+    floor_ts = int(time.time()) - days * 86400
+    with lock():
+        rows = conn.execute(
+            "SELECT date(settled_at, 'unixepoch') AS day, "
+            "       COUNT(*), COALESCE(SUM(pnl), 0), "
+            "       SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) "
+            "FROM settlements WHERE settled_at >= ? "
+            "GROUP BY day ORDER BY day",
+            (floor_ts,),
+        ).fetchall()
+    return [
+        {"date": r[0], "n_settlements": int(r[1] or 0),
+         "pnl": float(r[2] or 0.0), "n_wins": int(r[3] or 0)}
+        for r in rows
+    ]
+
+
+def strategy_pnl_summary(days: int = 30) -> list[dict[str, Any]]:
+    """Per-strategy rollup of settlements over the last `days` days.
+
+    Used by the dashboard's PnL-by-strategy chart. Note that today every
+    settlement row attributes to the *primary* strategy (`strategies[0]` in
+    `_tick`), so this rollup will reflect that until per-fill PnL
+    decomposition lands. See CLAUDE.md "Out of scope" for details.
+    """
+    conn = get_conn()
+    floor_ts = int(time.time()) - days * 86400
+    with lock():
+        rows = conn.execute(
+            "SELECT strategy, COUNT(*), COALESCE(SUM(pnl), 0), "
+            "       SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) "
+            "FROM settlements WHERE settled_at >= ? "
+            "GROUP BY strategy ORDER BY SUM(pnl) DESC",
+            (floor_ts,),
+        ).fetchall()
+    return [
+        {"strategy": r[0], "n_settlements": int(r[1] or 0),
+         "pnl": float(r[2] or 0.0), "n_wins": int(r[3] or 0)}
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

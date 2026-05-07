@@ -37,6 +37,7 @@ from polymarket_bot.persistence.repo import (
     Market,
     append_equity,
     inventory_for_market,
+    inventory_snapshot,
     latest_equity,
     markets_with_unsettled_fills,
     open_orders_by_market,
@@ -180,24 +181,42 @@ def _open_orders_by_bucket(event: WeatherEvent) -> dict[str, list[OpenOrder]]:
     return out
 
 
-def _held_yes_shares_by_bucket(event: WeatherEvent) -> dict[str, float]:
-    out: dict[str, float] = {}
-    for b in event.buckets:
-        yes, _, _, _ = inventory_for_market(b.market_id)
-        out[b.label] = yes
-    return out
+_EMPTY_INV: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
 
 
-def _held_no_shares_by_bucket(event: WeatherEvent) -> dict[str, float]:
-    out: dict[str, float] = {}
-    for b in event.buckets:
-        _, no, _, _ = inventory_for_market(b.market_id)
-        out[b.label] = no
-    return out
+def _held_yes_shares_by_bucket(
+    event: WeatherEvent,
+    snapshot: dict[str, tuple[float, float, float, float]] | None = None,
+) -> dict[str, float]:
+    """Held-YES per bucket. Uses `snapshot` if provided (batched), otherwise
+    falls back to the single-market query (kept for compatibility)."""
+    if snapshot is not None:
+        return {b.label: snapshot.get(b.market_id, _EMPTY_INV)[0] for b in event.buckets}
+    return {b.label: inventory_for_market(b.market_id)[0] for b in event.buckets}
 
 
-def _total_open_exposure_usd() -> float:
-    """Sum of (yes_shares × avg_yes_cost) across all unsettled markets."""
+def _held_no_shares_by_bucket(
+    event: WeatherEvent,
+    snapshot: dict[str, tuple[float, float, float, float]] | None = None,
+) -> dict[str, float]:
+    """Held-NO per bucket. See `_held_yes_shares_by_bucket` for the snapshot path."""
+    if snapshot is not None:
+        return {b.label: snapshot.get(b.market_id, _EMPTY_INV)[1] for b in event.buckets}
+    return {b.label: inventory_for_market(b.market_id)[1] for b in event.buckets}
+
+
+def _total_open_exposure_usd(
+    snapshot: dict[str, tuple[float, float, float, float]] | None = None,
+) -> float:
+    """Sum of (yes_shares × avg_yes_cost) across all unsettled markets.
+
+    With `snapshot` (the per-tick `inventory_snapshot` result) this is a pure
+    dict scan with no SQL. Without it, falls back to the legacy per-market
+    query path (preserved for callers that don't have a snapshot, e.g.
+    `_compute_mtm_equity` and `_repair_equity_curve`).
+    """
+    if snapshot is not None:
+        return sum(yes * avg_yes for (yes, _no, avg_yes, _avg_no) in snapshot.values())
     total = 0.0
     for mid in markets_with_unsettled_fills():
         yes, _, avg_yes, _ = inventory_for_market(mid)
@@ -380,6 +399,13 @@ def _tick(config: BotConfig, cities: list[str], broker: Broker,
         logger.debug("no_open_events")
     bankroll = latest_equity() or config.starting_bankroll
 
+    # One inventory pull per tick covers BetState construction (held_yes,
+    # held_no, total exposure) for every event × every strategy. Replaces
+    # the previous N+1 pattern of one inventory_for_market call per bucket
+    # per strategy.
+    all_market_ids = [b.market_id for ev in events for b in ev.buckets]
+    inv_snapshot = inventory_snapshot(all_market_ids) if all_market_ids else {}
+
     with httpx.Client(timeout=10.0) as client:
         for event in events:
             _persist_event(event)
@@ -393,17 +419,21 @@ def _tick(config: BotConfig, cities: list[str], broker: Broker,
             )
             if n_members == 0:
                 continue
+            held_yes = _held_yes_shares_by_bucket(event, inv_snapshot)
+            held_no = _held_no_shares_by_bucket(event, inv_snapshot)
             for strategy in strategies:
                 # Recompute exposure for each strategy so earlier strategies'
-                # bets in this tick already count toward the cap.
-                exposure_now = _total_open_exposure_usd()
+                # bets in this tick already count toward the cap. Uses the
+                # snapshot (zero SQL); freshly-placed orders haven't filled
+                # yet so the snapshot is still accurate within the tick.
+                exposure_now = _total_open_exposure_usd(inv_snapshot)
                 state = BetState(
                     event=event,
                     bankroll=bankroll,
                     seconds_to_resolution=seconds_to_res,
                     open_orders_by_bucket=_open_orders_by_bucket(event),
-                    held_yes_shares_by_bucket=_held_yes_shares_by_bucket(event),
-                    held_no_shares_by_bucket=_held_no_shares_by_bucket(event),
+                    held_yes_shares_by_bucket=held_yes,
+                    held_no_shares_by_bucket=held_no,
                     total_open_exposure_usd=exposure_now,
                     edge_threshold=config.edge_threshold,
                     kelly_fraction=config.kelly_fraction,

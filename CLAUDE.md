@@ -286,8 +286,13 @@ the env file). Vanilla JS SPA over a small JSON API.
 **API endpoints** ([`api.py`](src/polymarket_bot/dashboard/api.py)):
 
 - `GET /api/status` — mode, version, strategy, server time
-- `GET /api/position` — open orders + inventory + totals (cost / mtm /
-  unrealized)
+- `GET /api/dashboard?days=30` — **bundled endpoint** that drives the entire
+  Dashboard route in a single request: `stats_today`, `totals`,
+  `inventories`, `open_orders`, `equity_curve`, `daily_pnl`,
+  `strategy_pnl`. Replaces the old 4-parallel-fetch pattern.
+- `GET /api/position` — open orders + inventory + totals (kept for
+  back-compat; internally reuses `_build_position_payload` with batched
+  `inventory_snapshot` + `markets_bulk`)
 - `GET /api/equity-curve` — `{points: [{ts, equity}]}`
 - `GET /api/stats/today` — settlements / wins / pnl / latest_equity
 - `GET /api/fills?limit=N&offset=M` — `{fills, offset, has_more}`
@@ -296,8 +301,21 @@ the env file). Vanilla JS SPA over a small JSON API.
 - `GET /api/settings` — current config (secrets masked)
 - `GET /api/logs` — placeholder; returns `{lines: []}`
 
-The `has_more` field is computed server-side via the cheap `LIMIT N+1` trick
-— no `COUNT(*)` query.
+The `has_more` field on paginated endpoints is computed server-side via the
+cheap `LIMIT N+1` trick — no `COUNT(*)` query.
+
+**Dashboard charts and visualisations:**
+
+- **Equity curve** — uPlot line, full width.
+- **Daily P&L** (last 30 days) — uPlot bars, half width. Green/red by sign.
+- **Win-rate trend** (last 30 days) — uPlot sparkline, half width, y in [0,1].
+- **Inventory by city** — HTML/CSS horizontal bars, half width. Aggregates
+  current open positions by city extracted from the bucket title.
+- **P&L by strategy** — same HTML/CSS bar pattern, half width. Surfaces
+  the multi-strategy attribution from `settlements.strategy`.
+
+The two new uPlot instances reuse a shared `_makeChart(container, data, opts)`
+factory; the two HTML bar lists share `_renderBarList(container, rows, opts)`.
 
 **Frontend** ([`app.js`](src/polymarket_bot/dashboard/static/app.js)):
 
@@ -318,7 +336,10 @@ The `has_more` field is computed server-side via the cheap `LIMIT N+1` trick
 - `Table.destroy()` disconnects the `IntersectionObserver`. Standalone-page
   tables are tracked at module scope so `navigate()` can release them on
   route exit.
-- Auto-refresh: header every 5s, active page every 10s.
+- Auto-refresh: header every 5s, active page every **15s** (matches the
+  bot's tick cadence).
+  - Dashboard fetches a **single** `/api/dashboard` request per cycle —
+    one request replacing the previous 4 parallel calls.
   - **Disabled on Fills + Settlements** to avoid merging new rows into the
     user's scroll position. Re-navigating to those pages re-fetches.
   - Dashboard tables refresh via `Table.setRows(...)` so sort state is

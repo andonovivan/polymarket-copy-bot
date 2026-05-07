@@ -8,14 +8,17 @@ from typing import Any
 from polymarket_bot.config import BotConfig
 from polymarket_bot.persistence.repo import (
     all_open_orders,
+    daily_pnl_summary,
     equity_curve,
     get_market,
-    inventory_for_market,
+    inventory_snapshot,
     latest_equity,
     list_fills,
     list_settlements,
+    markets_bulk,
     markets_with_unsettled_fills,
     settlement_stats,
+    strategy_pnl_summary,
 )
 from polymarket_bot.strategy.registry import list_strategies
 
@@ -44,6 +47,80 @@ def _settlement_dict(s) -> dict[str, Any]:
     )}
 
 
+def _build_position_payload() -> dict[str, Any]:
+    """Build the open-orders + inventories + totals block.
+
+    Replaces the old N+1 pattern (one `inventory_for_market` and one
+    `get_market` call per row) with two bulk queries: `inventory_snapshot`
+    and `markets_bulk`.
+    """
+    orders = all_open_orders()
+    order_market_ids = {o.market_id for o in orders}
+    unsettled = set(markets_with_unsettled_fills())
+    inv_market_ids = sorted(unsettled | order_market_ids)
+
+    inv_map = inventory_snapshot(inv_market_ids)
+    market_map = markets_bulk(sorted(set(inv_market_ids) | order_market_ids))
+
+    inventories: list[dict[str, Any]] = []
+    total_cost = 0.0
+    priced_cost = 0.0       # only positions for which we have a current mid
+    priced_mtm = 0.0
+    unpriced_count = 0
+    for mid in inv_market_ids:
+        yes, no, avg_yes, avg_no = inv_map.get(mid, (0.0, 0.0, 0.0, 0.0))
+        if yes == 0 and no == 0:
+            continue
+        m = market_map.get(mid)
+        title = m.title if (m and m.title) else None
+        current_yes = m.last_yes_mid if (m and m.last_yes_mid is not None) else None
+        quoted_at = m.last_quote_ts if m else None
+        cost = yes * avg_yes + no * avg_no
+        mtm = (yes * current_yes) if current_yes is not None else None
+        unreal = (mtm - cost) if mtm is not None else None
+        total_cost += cost
+        if mtm is not None:
+            priced_cost += cost
+            priced_mtm += mtm
+        else:
+            unpriced_count += 1
+        inventories.append({
+            "market_id": mid,
+            "title": title,
+            "yes_shares": yes, "no_shares": no,
+            "avg_yes_cost": avg_yes, "avg_no_cost": avg_no,
+            "current_yes_price": current_yes,
+            "current_yes_quoted_at": quoted_at,
+            "cost": cost,
+            "mtm_value": mtm,
+            "unrealized_pnl": unreal,
+        })
+
+    order_dicts: list[dict[str, Any]] = []
+    for o in orders:
+        d = _order_dict(o)
+        mm = market_map.get(o.market_id)
+        d["title"] = mm.title if (mm and mm.title) else None
+        order_dicts.append(d)
+
+    # PnL is computed only over positions we can actually mark; mixing unpriced
+    # cost into the denominator would silently bias PnL low by that cost.
+    unrealized = (priced_mtm - priced_cost) if priced_cost > 0 else None
+    return {
+        "open_orders": order_dicts,
+        "inventories": inventories,
+        "count": len(orders) + len(inventories),
+        "totals": {
+            "cost": total_cost,
+            "mtm_value": priced_mtm,
+            "priced_cost": priced_cost,
+            "unpriced_cost": total_cost - priced_cost,
+            "unpriced_positions": unpriced_count,
+            "unrealized_pnl": unrealized,
+        },
+    }
+
+
 def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) -> tuple[int, Any]:
     if path == "/api/status":
         return 200, {
@@ -54,68 +131,33 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
         }
 
     if path == "/api/position":
-        # Inventory comes from FILLS (held shares awaiting settlement); open
-        # orders are listed separately. Each inventory row is enriched with the
-        # latest observed YES price so the dashboard can show unrealized P&L.
-        orders = all_open_orders()
-        order_market_ids = {o.market_id for o in orders}
-        unsettled = set(markets_with_unsettled_fills())
-        inv_market_ids = sorted(unsettled | order_market_ids)
-        inventories = []
-        total_cost = 0.0
-        priced_cost = 0.0       # only positions for which we have a current mid
-        priced_mtm = 0.0
-        unpriced_count = 0
-        for mid in inv_market_ids:
-            yes, no, avg_yes, avg_no = inventory_for_market(mid)
-            if yes == 0 and no == 0:
-                continue
-            m = get_market(mid)
-            title = (m.title if m and m.title else None)
-            current_yes = (m.last_yes_mid if m and m.last_yes_mid is not None else None)
-            quoted_at = (m.last_quote_ts if m else None)
-            cost = yes * avg_yes + no * avg_no
-            mtm = (yes * current_yes if current_yes is not None else None)
-            unreal = (mtm - cost) if mtm is not None else None
-            total_cost += cost
-            if mtm is not None:
-                priced_cost += cost
-                priced_mtm += mtm
-            else:
-                unpriced_count += 1
-            inventories.append({
-                "market_id": mid,
-                "title": title,
-                "yes_shares": yes, "no_shares": no,
-                "avg_yes_cost": avg_yes, "avg_no_cost": avg_no,
-                "current_yes_price": current_yes,
-                "current_yes_quoted_at": quoted_at,
-                "cost": cost,
-                "mtm_value": mtm,
-                "unrealized_pnl": unreal,
-            })
-        # Annotate orders with their human title.
-        order_dicts = []
-        for o in orders:
-            d = _order_dict(o)
-            mm = get_market(o.market_id)
-            d["title"] = mm.title if mm and mm.title else None
-            order_dicts.append(d)
-        # PnL is computed only over positions we can actually mark; mixing unpriced
-        # cost into the denominator would silently bias PnL low by that cost.
-        unrealized = (priced_mtm - priced_cost) if priced_cost > 0 else None
+        return 200, _build_position_payload()
+
+    if path == "/api/dashboard":
+        # Bundled endpoint that drives the entire Dashboard route in a single
+        # request. Replaces the previous 4-parallel-fetch pattern (`/api/status`
+        # subset + /api/stats/today + /api/equity-curve + /api/position +
+        # /api/fills?limit=15) and adds the daily/strategy aggregates that the
+        # new charts need.
+        position = _build_position_payload()
+        day_start = int(time.time()) - (int(time.time()) % 86400)
+        stats = settlement_stats(from_ts=day_start)
+        stats["latest_equity"] = latest_equity()
+        days = int(qs.get("days", ["30"])[0])
         return 200, {
-            "open_orders": order_dicts,
-            "inventories": inventories,
-            "count": len(orders) + len(inventories),
-            "totals": {
-                "cost": total_cost,
-                "mtm_value": priced_mtm,
-                "priced_cost": priced_cost,
-                "unpriced_cost": total_cost - priced_cost,
-                "unpriced_positions": unpriced_count,
-                "unrealized_pnl": unrealized,
-            },
+            "now": int(time.time()),
+            "version": VERSION,
+            "mode": config.mode if config else "paper",
+            "strategy": config.strategy if config else None,
+            "stats_today": stats,
+            "totals": position["totals"],
+            "inventories": position["inventories"],
+            "open_orders": position["open_orders"],
+            "equity_curve": [
+                {"ts": ts, "equity": eq} for ts, eq in equity_curve()
+            ],
+            "daily_pnl": daily_pnl_summary(days=days),
+            "strategy_pnl": strategy_pnl_summary(days=days),
         }
 
     if path == "/api/equity-curve":
