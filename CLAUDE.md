@@ -168,9 +168,12 @@ Read-only — never places orders. Off by default; enable with
 `RESEARCH_ENABLED=1` (production deployment sets this in
 [`docker-compose.yml`](docker-compose.yml)). When enabled, each tick:
 
-1. Builds a capture registry of **production cities + candidate cities**.
-   Production entries reuse `CITY_REGISTRY` directly; candidates are
-   geocoded lazily via Open-Meteo.
+1. Builds a capture registry of **production cities only** by default
+   (`RESEARCH_CAPTURE_CANDIDATES=0`). The candidate set (~36 non-promoted
+   cities) is opt-in via `RESEARCH_CAPTURE_CANDIDATES=1` — bumps cache
+   slots from 11 to 40, which can blow Open-Meteo's free-tier quota.
+   Production-only is enough to bootstrap calibration for the cities we
+   actually trade.
 2. Pre-filters slugs by expected end-date so we only gamma-fetch events
    plausibly settling within `RESEARCH_WINDOW_SECONDS` (default 1h, ±1d
    margin to absorb timezone quirks).

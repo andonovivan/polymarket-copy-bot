@@ -41,38 +41,50 @@ from polymarket_bot.polymarket.weather_markets import (
 logger = structlog.get_logger()
 
 
+# Registry cache. Built lazily on first capture call, persists for process
+# lifetime. Includes candidates only when `include_candidates=True`.
 _CAPTURE_REGISTRY: dict[str, City] = {}
+_REGISTRY_INCLUDED_CANDIDATES: bool = False
 
 
-def _capture_registry() -> dict[str, City]:
-    """Cities to capture: production CITY_REGISTRY + lazily-geocoded candidates.
+def _capture_registry(include_candidates: bool = False) -> dict[str, City]:
+    """Cities to capture.
+
+    Always includes production `CITY_REGISTRY` (we want bias + calibration
+    derived from the cities we actually trade). Optionally also includes the
+    lazily-geocoded candidate set, for future city promotion.
 
     Capturing production cities feeds the calibration layer with the SAME
-    model that's actively trading, so per-city bias and isotonic calibration
-    are derived from real production data — not a 3-model historical proxy.
+    model that's actively trading — no leakage, no API mismatch with the
+    backtest harness.
     """
-    if _CAPTURE_REGISTRY:
+    global _REGISTRY_INCLUDED_CANDIDATES
+    if _CAPTURE_REGISTRY and _REGISTRY_INCLUDED_CANDIDATES == include_candidates:
         return _CAPTURE_REGISTRY
-    # Production cities — already have geocoded entries with airport coords.
+    # Rebuild — flag may have flipped on restart.
+    _CAPTURE_REGISTRY.clear()
     for key, city in CITY_REGISTRY.items():
         _CAPTURE_REGISTRY[key] = city
-    # Candidate cities — geocode lazily, default to celsius (Path B's
-    # detect-on-event override below adapts if a market shows up in °F).
-    for slug in CANDIDATES:
-        if slug in _CAPTURE_REGISTRY:
-            continue
-        geo = geocode(slug)
-        if geo is None:
-            logger.warning("research_geocode_failed", city=slug)
-            continue
-        _CAPTURE_REGISTRY[slug] = City(
-            key=slug, lat=geo.lat, lon=geo.lon, tz=geo.tz,
-            unit="celsius",
-            event_slug_prefix=f"highest-temperature-in-{slug}-on-",
-        )
+    if include_candidates:
+        # Geocode lazily; default to celsius (per-event detection in the
+        # capture loop adapts if a market shows up in °F).
+        for slug in CANDIDATES:
+            if slug in _CAPTURE_REGISTRY:
+                continue
+            geo = geocode(slug)
+            if geo is None:
+                logger.warning("research_geocode_failed", city=slug)
+                continue
+            _CAPTURE_REGISTRY[slug] = City(
+                key=slug, lat=geo.lat, lon=geo.lon, tz=geo.tz,
+                unit="celsius",
+                event_slug_prefix=f"highest-temperature-in-{slug}-on-",
+            )
+    _REGISTRY_INCLUDED_CANDIDATES = include_candidates
     if _CAPTURE_REGISTRY:
         logger.info("research_registry_loaded",
                     count=len(_CAPTURE_REGISTRY),
+                    include_candidates=include_candidates,
                     cities=sorted(_CAPTURE_REGISTRY.keys()))
     return _CAPTURE_REGISTRY
 
@@ -125,12 +137,13 @@ def _expected_end_ts(slug_date: datetime) -> int:
 
 def capture_observations(*, window_seconds: int = 3600,
                          dedupe_seconds: int = 600,
-                         days_ahead: int = 4) -> int:
-    """Snapshot candidate-city events settling within the next `window_seconds`.
+                         days_ahead: int = 4,
+                         include_candidates: bool = False) -> int:
+    """Snapshot capture-registry events settling within the next `window_seconds`.
 
     Returns the number of new obs rows written.
     """
-    registry = _capture_registry()
+    registry = _capture_registry(include_candidates=include_candidates)
     if not registry:
         return 0
     now = int(datetime.now(timezone.utc).timestamp())

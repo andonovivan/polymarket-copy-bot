@@ -386,6 +386,7 @@ def _tick(config: BotConfig, cities: list[str], broker: Broker, router: Router,
                 window_seconds=config.research_window_seconds,
                 dedupe_seconds=config.research_dedupe_seconds,
                 days_ahead=config.days_ahead,
+                include_candidates=config.research_capture_candidates,
             )
             update_outcomes()
         except Exception as exc:

@@ -74,11 +74,16 @@ class BotConfig(BaseModel):
 
     # --- Research / live-capture (Path B for city evaluation) ---
     research_enabled: bool = Field(default=False,
-                                   description="Capture model_p / market_p / outcome for non-promoted candidate cities")
+                                   description="Capture (model_p, model_day_max_mean, market_p, outcome) per bucket")
     research_window_seconds: int = Field(default=3600,
                                          description="Only snapshot events settling within this many seconds")
     research_dedupe_seconds: int = Field(default=600,
                                          description="Skip if same (city, slug, bucket) was observed this recently")
+    research_capture_candidates: bool = Field(
+        default=False,
+        description=("Also capture the non-promoted candidate cities (in addition to "
+                     "production CITY_REGISTRY). Off by default — enable when API quota allows."),
+    )
 
     @classmethod
     def from_env(cls) -> BotConfig:
@@ -112,4 +117,5 @@ class BotConfig(BaseModel):
             research_enabled=os.getenv("RESEARCH_ENABLED", "0") == "1",
             research_window_seconds=int(os.getenv("RESEARCH_WINDOW_SECONDS", "3600")),
             research_dedupe_seconds=int(os.getenv("RESEARCH_DEDUPE_SECONDS", "600")),
+            research_capture_candidates=os.getenv("RESEARCH_CAPTURE_CANDIDATES", "0") == "1",
         )
