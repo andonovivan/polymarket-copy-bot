@@ -52,8 +52,15 @@ class Bucket:
     yes_bid: float | None
     yes_ask: float | None                # what we'd pay to BUY YES
     yes_mid: float | None
-    depth_yes_ask_usd: float             # ask-side liquidity we'd cross
+    depth_yes_ask_usd: float             # YES-ask-side liquidity we'd cross
     model_p: float | None = None         # filled by the strategy ctx (None if no forecast)
+    # NO-side quotes (for the over-priced-bucket case — sell YES is rare; we
+    # buy NO instead, which has the same payoff structure). Populated by
+    # populate_quotes from the CLOB NO order book.
+    no_bid: float | None = None
+    no_ask: float | None = None
+    no_mid: float | None = None
+    depth_no_ask_usd: float = 0.0
 
 
 @dataclass
@@ -100,6 +107,10 @@ class BetState:
     max_total_exposure_pct: float        # cap on aggregate bankroll committed
     min_market_depth_usd: float          # skip buckets thinner than this
     lockout_seconds: int                 # don't bet within N seconds of resolution
+    # bucket label → already-held NO shares (symmetric to held_yes; prevents
+    # NO double-entry after a NO BUY fills and is no longer in
+    # `open_orders_by_bucket`). Defaulted so existing test fixtures still work.
+    held_no_shares_by_bucket: dict[str, float] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

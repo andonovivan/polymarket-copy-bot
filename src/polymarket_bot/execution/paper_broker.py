@@ -61,13 +61,24 @@ class PaperBroker(Broker):
         return True
 
     def reconcile_fills(self, event: WeatherEvent) -> int:
-        """For each bucket in the event, fetch its YES book and fill any open orders that cross."""
+        """For each bucket, fetch the appropriate (YES or NO) book per open
+        order and fill any orders that cross."""
         n_filled = 0
         for b in event.buckets:
-            book = fetch_book(b.yes_token_id)
-            yes_bid, yes_ask, _ = parse_book(book)
+            yes_book = None
+            no_book = None
             for o in open_orders_by_market(b.market_id):
-                if not _crossed(o, yes_bid, yes_ask):
+                if o.token_side == "YES":
+                    if yes_book is None:
+                        yes_bid, yes_ask, _ = parse_book(fetch_book(b.yes_token_id))
+                        yes_book = (yes_bid, yes_ask)
+                    bid, ask = yes_book
+                else:   # NO
+                    if no_book is None:
+                        no_bid, no_ask, _ = parse_book(fetch_book(b.no_token_id))
+                        no_book = (no_bid, no_ask)
+                    bid, ask = no_book
+                if not _crossed(o, bid, ask):
                     continue
                 insert_fill(Fill(
                     id=None, order_id=o.order_id, market_id=o.market_id,
@@ -80,16 +91,18 @@ class PaperBroker(Broker):
                 n_filled += 1
                 logger.info("paper_order_filled",
                             order_id=o.order_id[:18], bucket=b.label,
+                            token=o.token_side, side=o.side,
                             price=o.price, size=o.size)
         return n_filled
 
 
-def _crossed(order: Order, yes_bid: float | None, yes_ask: float | None) -> bool:
-    """Did the YES book cross our limit since we placed?
+def _crossed(order: Order, bid: float | None, ask: float | None) -> bool:
+    """Did the order's book cross our limit since we placed?
 
-    BUY at P: fills if yes_ask <= P (someone is selling at or below our bid).
-    SELL at P: fills if yes_bid >= P (someone bidding at or above our ask).
+    Works for either YES or NO tokens — caller passes the matching book.
+    BUY at P: fills if ask <= P (someone is selling at or below our bid).
+    SELL at P: fills if bid >= P (someone bidding at or above our ask).
     """
     if order.side == "BUY":
-        return yes_ask is not None and yes_ask <= order.price
-    return yes_bid is not None and yes_bid >= order.price
+        return ask is not None and ask <= order.price
+    return bid is not None and bid >= order.price

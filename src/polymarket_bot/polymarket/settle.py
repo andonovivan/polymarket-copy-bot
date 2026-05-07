@@ -56,11 +56,13 @@ def settle_resolved_event(  # noqa: D401 — clarity over brevity
         outcome_label = "WIN" if won else "LOSS"
 
         yes_shares, no_shares, avg_yes, avg_no = inventory_for_market(b.market_id)
-        # We only ever BUY YES in WeatherForecast — yes_shares is the position;
-        # no_shares should be 0. Guard the math anyway.
+        # YES pays $1 each if the bucket wins; NO pays $1 each if it doesn't.
         gross_payout = (yes_shares if won else 0.0) + (0.0 if won else no_shares)
         cost = avg_yes * yes_shares + avg_no * no_shares
-        winnings = max(0.0, gross_payout - cost) if won else 0.0
+        # Polymarket charges the 5% taker fee on net winnings, regardless of
+        # which side won — so a profitable NO trade also pays the fee. The
+        # `max(0, ...)` guard ensures losses don't accrue a negative fee.
+        winnings = max(0.0, gross_payout - cost)
         fee = winnings * fee_rate
         payout = gross_payout - fee
         pnl = payout - cost

@@ -101,16 +101,23 @@ def _persist_event(event: WeatherEvent) -> None:
         ))
 
 
-def _attach_model_probabilities(event: WeatherEvent) -> int:
+def _attach_model_probabilities(event: WeatherEvent,
+                                seconds_to_resolution: int = 0,
+                                config: BotConfig | None = None) -> int:
     """Fetch the ensemble forecast for this event's date and fill bucket.model_p.
 
-    Two calibration layers are applied (each is a no-op until enough Path B
-    data accumulates — see strategy/calibration.py):
+    Layers applied in order (each is a no-op until conditions are met):
 
-      1. **Bias correction** — shift members by the historical median
-         (model − actual) so the bucketing reflects the city's known offset.
-      2. **Isotonic calibration** — map raw bucket probabilities through a
-         fitted `model_p → observed_freq` curve, fixing under-/over-dispersion.
+      1. **Bias correction** — shift members by the historical (model − actual)
+         curve so bucketing reflects the city's known temperature-conditional
+         bias. (calibration.py — needs ≥10 settled events.)
+      2. **Bayesian fusion** — if within `bayesian_fusion_within_seconds` of
+         resolution, fetch today's observed-so-far max and shift each member
+         up to at least that value (monotonicity of daily max).
+      3. **Bucketing** — count members per bucket.
+      4. **Isotonic calibration** — map raw bucket probabilities through a
+         fitted `model_p → observed_freq` curve. (calibration.py — needs ≥110
+         bucket-level observations.)
     """
     from polymarket_bot.strategy.calibration import (
         apply_bias_correction, apply_calibration,
@@ -120,18 +127,39 @@ def _attach_model_probabilities(event: WeatherEvent) -> int:
     city = CITY_REGISTRY.get(event.city_key)
     if city is None:
         return 0
-    # The market resolves at end_ts; the date that "owns" it is end_ts in UTC.
-    # Polymarket's slug embeds the calendar day; we trust that.
     target_date = datetime.fromtimestamp(event.resolution_ts, tz=timezone.utc).strftime("%Y-%m-%d")
     forecast = get_ensemble(city, target_date)
     if forecast is None or not forecast.members:
         return 0
+
+    # Layer 1 — temperature-conditional bias correction.
     bias_curve = get_city_bias_curve(event.city_key)
     members = apply_bias_correction(forecast.members, bias_curve)
+
+    # Layer 2 — Bayesian fusion with observed-so-far temperature.
+    if (config is not None
+            and config.bayesian_fusion_enabled
+            and 0 < seconds_to_resolution <= config.bayesian_fusion_within_seconds):
+        from polymarket_bot.data.observations import (
+            fuse_ensemble_with_observation, get_observed_max_today,
+        )
+        observed = get_observed_max_today(city, target_date)
+        if observed is not None:
+            n_shifted = sum(1 for m in members if m < int(round(observed)))
+            members = fuse_ensemble_with_observation(members, observed)
+            if n_shifted > 0:
+                logger.info("bayesian_fusion_applied",
+                            city=event.city_key, observed=round(observed, 1),
+                            n_members_shifted=n_shifted)
+
+    # Layer 3 — bucket counts.
     labels = [b.label for b in event.buckets]
     probs = bucket_probabilities(members, labels)
+
+    # Layer 4 — isotonic probability calibration.
     calibrator = get_city_calibrator(event.city_key)
     probs = apply_calibration(probs, calibrator)
+
     for b in event.buckets:
         b.model_p = probs.get(b.label, 0.0)
     return len(forecast.members)
@@ -157,6 +185,14 @@ def _held_yes_shares_by_bucket(event: WeatherEvent) -> dict[str, float]:
     for b in event.buckets:
         yes, _, _, _ = inventory_for_market(b.market_id)
         out[b.label] = yes
+    return out
+
+
+def _held_no_shares_by_bucket(event: WeatherEvent) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for b in event.buckets:
+        _, no, _, _ = inventory_for_market(b.market_id)
+        out[b.label] = no
     return out
 
 
@@ -283,9 +319,13 @@ def cmd_run(config: BotConfig, args: argparse.Namespace) -> None:
         synced = sync_wallet_balance(live_client)
         if synced is not None:
             logger.info("live_bankroll_set", usdc=round(synced, 4))
-    StrategyClass = get_strategy_class(config.strategy)
-    strategy = StrategyClass()
-    router = Router(broker, strategy.name)
+    # Multi-strategy support: each name in `config.strategy` (comma-separated)
+    # is instantiated and gets its own router so per-strategy PnL attribution
+    # works through the existing fills.strategy column. The first name is the
+    # "primary" strategy reported on the dashboard.
+    names = [n.strip() for n in config.strategy.split(",") if n.strip()]
+    strategies = [get_strategy_class(n)() for n in names]
+    routers = {s.name: Router(broker, s.name) for s in strategies}
     cities = [c.strip() for c in config.weather_cities.split(",") if c.strip()]
     cities = [c for c in cities if c in CITY_REGISTRY]
     if not cities:
@@ -298,7 +338,7 @@ def cmd_run(config: BotConfig, args: argparse.Namespace) -> None:
     logger.info(
         "bot_starting",
         mode="live" if args.live else config.mode,
-        strategy=strategy.name,
+        strategies=[s.name for s in strategies],
         cities=cities,
         edge_threshold=config.edge_threshold,
         kelly_fraction=config.kelly_fraction,
@@ -317,7 +357,7 @@ def cmd_run(config: BotConfig, args: argparse.Namespace) -> None:
             break
 
         try:
-            _tick(config, cities, broker, router, strategy)
+            _tick(config, cities, broker, routers, strategies)
         except Exception as exc:
             logger.error("tick_error", error=str(exc))
 
@@ -333,8 +373,8 @@ def cmd_run(config: BotConfig, args: argparse.Namespace) -> None:
     logger.info("bot_stopped")
 
 
-def _tick(config: BotConfig, cities: list[str], broker: Broker, router: Router,
-          strategy) -> None:
+def _tick(config: BotConfig, cities: list[str], broker: Broker,
+          routers: dict[str, Router], strategies: list) -> None:
     events = discover_open_events(cities, days_ahead=config.days_ahead)
     if not events:
         logger.debug("no_open_events")
@@ -343,38 +383,45 @@ def _tick(config: BotConfig, cities: list[str], broker: Broker, router: Router,
     with httpx.Client(timeout=10.0) as client:
         for event in events:
             _persist_event(event)
-            n_quoted = populate_quotes(event, client=client)
+            n_quoted = populate_quotes(event, client=client,
+                                       fetch_no_book=config.no_side_enabled)
             if n_quoted == 0:
                 continue
-            n_members = _attach_model_probabilities(event)
+            seconds_to_res = max(0, event.resolution_ts - int(time.time()))
+            n_members = _attach_model_probabilities(
+                event, seconds_to_resolution=seconds_to_res, config=config,
+            )
             if n_members == 0:
                 continue
-
-            seconds_to_res = max(0, event.resolution_ts - int(time.time()))
-            # Recompute exposure each event so this tick's earlier bets are honoured.
-            exposure_now = _total_open_exposure_usd()
-            state = BetState(
-                event=event,
-                bankroll=bankroll,
-                seconds_to_resolution=seconds_to_res,
-                open_orders_by_bucket=_open_orders_by_bucket(event),
-                held_yes_shares_by_bucket=_held_yes_shares_by_bucket(event),
-                total_open_exposure_usd=exposure_now,
-                edge_threshold=config.edge_threshold,
-                kelly_fraction=config.kelly_fraction,
-                max_bet_pct=config.max_bet_pct,
-                max_total_exposure_pct=config.max_total_exposure_pct,
-                min_market_depth_usd=config.min_market_depth_usd,
-                lockout_seconds=config.lock_buffer_seconds,
-            )
-            actions = strategy.evaluate(state)
-            if actions:
-                router.execute(actions)
+            for strategy in strategies:
+                # Recompute exposure for each strategy so earlier strategies'
+                # bets in this tick already count toward the cap.
+                exposure_now = _total_open_exposure_usd()
+                state = BetState(
+                    event=event,
+                    bankroll=bankroll,
+                    seconds_to_resolution=seconds_to_res,
+                    open_orders_by_bucket=_open_orders_by_bucket(event),
+                    held_yes_shares_by_bucket=_held_yes_shares_by_bucket(event),
+                    held_no_shares_by_bucket=_held_no_shares_by_bucket(event),
+                    total_open_exposure_usd=exposure_now,
+                    edge_threshold=config.edge_threshold,
+                    kelly_fraction=config.kelly_fraction,
+                    max_bet_pct=config.max_bet_pct,
+                    max_total_exposure_pct=config.max_total_exposure_pct,
+                    min_market_depth_usd=config.min_market_depth_usd,
+                    lockout_seconds=config.lock_buffer_seconds,
+                )
+                actions = strategy.evaluate(state)
+                if actions:
+                    routers[strategy.name].execute(actions)
 
             broker.reconcile_fills(event)
 
-    # Settle anything that's resolved on gamma since the last tick.
-    _settle_due_events(strategy.name, winning_fee_bps=config.winning_fee_bps)
+    # Settle anything that's resolved on gamma since the last tick. The
+    # primary strategy name owns the settlement rows (PnL accounting).
+    primary_name = strategies[0].name if strategies else "weather_forecast"
+    _settle_due_events(primary_name, winning_fee_bps=config.winning_fee_bps)
 
     # Read-only research capture for candidate cities (Path B).
     if config.research_enabled:

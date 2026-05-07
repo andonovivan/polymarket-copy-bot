@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from polymarket_bot.strategy.base import BettingStrategy
+from polymarket_bot.strategy.bucket_arbitrage import BucketArbitrageStrategy
 from polymarket_bot.strategy.weather_forecast import WeatherForecastStrategy
 
 _REGISTRY: dict[str, type[BettingStrategy]] = {
     WeatherForecastStrategy.name: WeatherForecastStrategy,
+    BucketArbitrageStrategy.name: BucketArbitrageStrategy,
 }
 
 

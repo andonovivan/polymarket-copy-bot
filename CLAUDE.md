@@ -85,7 +85,15 @@ src/polymarket_bot/
 tests/                   pytest, 60 unit tests
 ```
 
-## Strategy: `weather_forecast`
+## Strategies (multi-strategy support)
+
+The bot now runs **multiple strategies in parallel** per tick. `STRATEGY` is a
+comma-separated list (e.g. `"weather_forecast,bucket_arbitrage"`); each
+strategy gets its own `Router` so per-strategy PnL attribution is preserved
+through the existing `fills.strategy` column. The first name in the list is
+the "primary" strategy that owns settlement-row attribution.
+
+### `weather_forecast`
 
 [`src/polymarket_bot/strategy/weather_forecast.py`](src/polymarket_bot/strategy/weather_forecast.py).
 
@@ -93,12 +101,24 @@ Inputs per tick (a `BetState`):
 
 - **Open buckets** for an event (e.g. 11 buckets covering 7°C-or-below ... 17°C-or-higher).
 - **`model_p`** per bucket from `bucket_probabilities(members, labels)`.
-- **YES ask** per bucket from the order book.
+- **YES + NO bid/ask** per bucket from the order book (NO only when
+  `NO_SIDE_ENABLED=1`).
 - Current bankroll, exposure, lockout window, etc.
 
-For each bucket the strategy computes `edge = model_p − yes_ask`. If `edge ≥
-EDGE_THRESHOLD` (default 0.05) and the order-book depth is sufficient, it
-sizes a buy via fractional-Kelly:
+Three actions per bucket each tick (in priority order):
+
+1. **Profit-take exit (#3).** If we hold YES shares and the current `yes_bid`
+   exceeds `0.95·model_p + PROFIT_TAKE_BUFFER` (default 0.10), place a SELL
+   for the full position at `yes_bid`. Locks in variance reduction on
+   lottery tickets that paid off; the 0.95 factor accounts for the 5%
+   winning fee on holding to resolution.
+2. **YES entry.** `edge = model_p − yes_ask`. If `edge ≥ EDGE_THRESHOLD`
+   (default 0.05), BUY YES sized fractional-Kelly.
+3. **NO entry (#2).** `edge_no = (1 − model_p) − no_ask`. If `edge_no ≥
+   EDGE_THRESHOLD`, BUY NO sized fractional-Kelly. Symmetric to YES; only
+   evaluated when `NO_SIDE_ENABLED=1` (Bucket has no_bid/no_ask).
+
+Sizing:
 
 ```
 b      = (1 - price) / price
@@ -112,6 +132,29 @@ Risk caps:
 - `MAX_TOTAL_EXPOSURE_PCT` aggregate cap across all open positions
 - `LOCK_BUFFER_SECONDS` — stop placing bets within N seconds of resolution
 - `MIN_MARKET_DEPTH_USD` — skip thin books
+
+### `bucket_arbitrage` (#1)
+
+[`src/polymarket_bot/strategy/bucket_arbitrage.py`](src/polymarket_bot/strategy/bucket_arbitrage.py).
+
+Model-independent structural alpha. Each event's 11 mutually-exclusive YES
+buckets must sum to ~$1 in a fair market. When the total YES asks across
+all buckets is materially below $1 (≥ `ARBITRAGE_THRESHOLD = 7%` headroom),
+the strategy buys every bucket at its ask in equal shares — the eventual
+winner pays $1 regardless, locking in `(net_payout − cost) / cost` net of
+the 5% taker fee. Conservative depth checks and a per-event cap
+(`MAX_ARBITRAGE_PCT = 5%` of bankroll) prevent fat-finger blowups.
+
+### Bayesian fusion with observed temperatures (#4)
+
+Inside `_attach_model_probabilities`, before bucketing: when an event is
+within `BAYESIAN_FUSION_WITHIN_SECONDS` (default 6h) of resolution, the
+bot fetches the city's max temperature observed so far today
+([`data/observations.py`](src/polymarket_bot/data/observations.py)) and
+shifts every ensemble member up to at least that value. Daily max is
+monotonically non-decreasing, so once we've observed 22°C every member
+predicting <22°C is falsified — this sharpens probabilities right before
+the betting cutoff. Off via `BAYESIAN_FUSION_ENABLED=0`.
 
 ## City registry
 
@@ -314,7 +357,14 @@ vars override. Notable knobs:
 - `TICK_SECONDS` — polling cadence
 - `DAYS_AHEAD` — how many forward days of markets to consider
 - `RESEARCH_ENABLED` / `RESEARCH_WINDOW_SECONDS` / `RESEARCH_DEDUPE_SECONDS`
-  — Path B controls
+  / `RESEARCH_CAPTURE_CANDIDATES` — Path B controls
+- `BAYESIAN_FUSION_ENABLED` / `BAYESIAN_FUSION_WITHIN_SECONDS` — observed-temp
+  fusion in `_attach_model_probabilities` (#4)
+- `NO_SIDE_ENABLED` — pulls the NO order book in `populate_quotes` and lets
+  `weather_forecast` buy NO on over-priced buckets (#2). Doubles per-bucket
+  CLOB calls; off by default.
+- `STRATEGY` — comma-separated list (e.g. `"weather_forecast,bucket_arbitrage"`).
+  First entry is the primary strategy for settlement attribution.
 - `POLYMARKET_BOT_LIVE` (must be `1` to enable real orders, paired with
   `--live` flag)
 

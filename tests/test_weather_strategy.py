@@ -11,13 +11,15 @@ from polymarket_bot.strategy.base import (
 from polymarket_bot.strategy.weather_forecast import WeatherForecastStrategy
 
 
-def _bucket(label: str, ask: float, model_p: float, depth: float = 100.0) -> Bucket:
+def _bucket(label: str, ask: float, model_p: float, depth: float = 100.0,
+            bid: float | None = None) -> Bucket:
+    yes_bid = bid if bid is not None else max(0.001, ask - 0.01)
     return Bucket(
         label=label,
         market_id=f"mkt-{label}",
         yes_token_id=f"yes-{label}",
         no_token_id=f"no-{label}",
-        yes_bid=ask - 0.01, yes_ask=ask, yes_mid=ask - 0.005,
+        yes_bid=yes_bid, yes_ask=ask, yes_mid=(yes_bid + ask) / 2,
         depth_yes_ask_usd=depth, model_p=model_p,
     )
 
@@ -26,6 +28,7 @@ def _state(buckets: list[Bucket], *, bankroll: float = 100.0,
            seconds_to_resolution: int = 3600,
            open_orders: dict | None = None,
            held_yes: dict | None = None,
+           held_no: dict | None = None,
            total_exposure: float = 0.0,
            edge_threshold: float = 0.05,
            lockout_seconds: int = 600,
@@ -40,6 +43,7 @@ def _state(buckets: list[Bucket], *, bankroll: float = 100.0,
         event=event, bankroll=bankroll, seconds_to_resolution=seconds_to_resolution,
         open_orders_by_bucket=open_orders or {},
         held_yes_shares_by_bucket=held_yes or {},
+        held_no_shares_by_bucket=held_no or {},
         total_open_exposure_usd=total_exposure,
         edge_threshold=edge_threshold, kelly_fraction=0.25,
         max_bet_pct=0.05, max_total_exposure_pct=max_total_exposure_pct,
@@ -156,3 +160,162 @@ def test_partial_exposure_caps_bet_size():
         notional = a.price * a.size
         assert notional <= 2.0 + 1e-6
     # Or empty if the headroom was below MIN_ORDER_NOTIONAL.
+
+
+# ---------------------------------------------------------------------------
+# Profit-taking SELL behavior (#3).
+# ---------------------------------------------------------------------------
+
+
+def test_profit_take_sells_when_bid_well_above_threshold():
+    # Bought at 0.10, model_p=0.20 → hold-EV = 0.20×0.95 = 0.19. Threshold
+    # = 0.19 + 0.10 = 0.29. Bid 0.40 > 0.29 → SELL.
+    bucket = _bucket("16°C", ask=0.41, model_p=0.20, bid=0.40)
+    actions = WeatherForecastStrategy().evaluate(_state(
+        [bucket], held_yes={"16°C": 50.0},
+    ))
+    assert len(actions) == 1
+    a = actions[0]
+    assert isinstance(a, PlaceLimit)
+    assert a.side == "SELL"
+    assert a.token_side == "YES"
+    assert a.price == 0.40
+    assert a.size == 50.0
+
+
+def test_profit_take_holds_when_bid_below_threshold():
+    # model_p=0.50 → threshold = 0.50×0.95 + 0.10 = 0.575. Bid 0.55 < 0.575 → HOLD.
+    bucket = _bucket("16°C", ask=0.56, model_p=0.50, bid=0.55)
+    actions = WeatherForecastStrategy().evaluate(_state(
+        [bucket], held_yes={"16°C": 50.0},
+    ))
+    assert actions == []
+
+
+def test_profit_take_skips_when_already_open_sell():
+    from polymarket_bot.strategy.base import OpenOrder
+    bucket = _bucket("16°C", ask=0.41, model_p=0.20, bid=0.40)
+    open_order = OpenOrder(
+        order_id="x", client_order_id="y", market_id="m",
+        token_side="YES", side="SELL", price=0.40, size=50.0,
+    )
+    actions = WeatherForecastStrategy().evaluate(_state(
+        [bucket],
+        held_yes={"16°C": 50.0},
+        open_orders={"16°C": [open_order]},
+    ))
+    assert actions == []
+
+
+def test_profit_take_skips_when_below_min_notional():
+    # 1 share × 0.40 = $0.40 < $1 minimum. No SELL.
+    bucket = _bucket("16°C", ask=0.41, model_p=0.20, bid=0.40)
+    actions = WeatherForecastStrategy().evaluate(_state(
+        [bucket], held_yes={"16°C": 1.0},
+    ))
+    assert actions == []
+
+
+def test_profit_take_does_not_buy_more_when_holding():
+    # Even if there's edge, we don't double up while we already hold.
+    bucket = _bucket("16°C", ask=0.10, model_p=0.50, bid=0.05)
+    actions = WeatherForecastStrategy().evaluate(_state(
+        [bucket], held_yes={"16°C": 50.0},
+    ))
+    # Held + bid=0.05 below threshold → no BUY, no SELL.
+    assert actions == []
+
+
+# ---------------------------------------------------------------------------
+# NO-side trades (#2).
+# ---------------------------------------------------------------------------
+
+
+def _bucket_with_no(label: str, yes_ask: float, model_p: float,
+                    no_ask: float, no_depth: float = 100.0) -> Bucket:
+    """Bucket with both YES and NO quotes populated (NO opt-in path)."""
+    b = _bucket(label, yes_ask, model_p)
+    b.no_bid = max(0.001, no_ask - 0.01)
+    b.no_ask = no_ask
+    b.no_mid = (b.no_bid + no_ask) / 2
+    b.depth_no_ask_usd = no_depth
+    return b
+
+
+def test_no_side_buy_when_bucket_overpriced():
+    # model_p=0.20 → model_no_p=0.80. Bucket priced rich on YES (ask 0.50)
+    # → NO ask should be cheap (~0.50). edge_no = 0.80 − 0.50 = 0.30, fires.
+    bucket = _bucket_with_no("16°C", yes_ask=0.50, model_p=0.20, no_ask=0.50)
+    actions = WeatherForecastStrategy().evaluate(_state([bucket]))
+    # Should fire NO BUY only (no YES BUY since 0.20 < 0.50).
+    no_actions = [a for a in actions if isinstance(a, PlaceLimit) and a.token_side == "NO"]
+    yes_actions = [a for a in actions if isinstance(a, PlaceLimit) and a.token_side == "YES"]
+    assert len(no_actions) == 1
+    assert no_actions[0].side == "BUY"
+    assert no_actions[0].price == 0.50
+    assert yes_actions == []
+
+
+def test_no_side_skipped_when_no_quotes_unset():
+    # model_p=0.20 means NO is theoretically attractive, but with no_ask=None
+    # the strategy can't act.
+    bucket = _bucket("16°C", ask=0.50, model_p=0.20)
+    # bucket.no_ask is None by default
+    actions = WeatherForecastStrategy().evaluate(_state([bucket]))
+    assert actions == []
+
+
+def test_no_side_below_min_depth_skipped():
+    bucket = _bucket_with_no("16°C", yes_ask=0.50, model_p=0.20,
+                              no_ask=0.50, no_depth=5.0)
+    actions = WeatherForecastStrategy().evaluate(_state([bucket]))
+    assert actions == []
+
+
+def test_no_side_no_edge_skipped():
+    # model_p=0.50 → model_no_p=0.50. NO ask 0.49 → edge 0.01 < threshold 0.05.
+    bucket = _bucket_with_no("16°C", yes_ask=0.51, model_p=0.50, no_ask=0.49)
+    actions = WeatherForecastStrategy().evaluate(_state([bucket]))
+    assert actions == []
+
+
+def test_yes_and_no_edge_are_mutually_exclusive_in_tight_market():
+    # YES edge: model_p=0.45 > yes_ask=0.30 → edge 0.15 fires YES
+    # NO edge:  model_no_p=0.55 vs no_ask=0.69 → edge -0.14 (no fire)
+    # Tight markets can have at most one side with positive edge.
+    bucket = _bucket_with_no("16°C", yes_ask=0.30, model_p=0.45, no_ask=0.69)
+    actions = WeatherForecastStrategy().evaluate(_state([bucket]))
+    yes_buys = [a for a in actions if isinstance(a, PlaceLimit) and a.token_side == "YES" and a.side == "BUY"]
+    no_buys = [a for a in actions if isinstance(a, PlaceLimit) and a.token_side == "NO" and a.side == "BUY"]
+    assert len(yes_buys) == 1
+    assert len(no_buys) == 0
+
+
+def test_no_side_no_double_bet():
+    # If we already have an open NO BUY, we don't place another.
+    from polymarket_bot.strategy.base import OpenOrder
+    bucket = _bucket_with_no("16°C", yes_ask=0.50, model_p=0.20, no_ask=0.50)
+    open_no = OpenOrder(
+        order_id="x", client_order_id="y", market_id="m",
+        token_side="NO", side="BUY", price=0.50, size=10.0,
+    )
+    actions = WeatherForecastStrategy().evaluate(_state(
+        [bucket], open_orders={"16°C": [open_no]}
+    ))
+    assert all(a.token_side != "NO" for a in actions if isinstance(a, PlaceLimit))
+
+
+def test_no_side_no_reentry_after_fill():
+    """Regression: after a NO BUY fills (no longer in open_orders), the
+    held-NO check must prevent re-entry on the same edge. Without this the
+    strategy would compound NO every tick the edge persists."""
+    bucket = _bucket_with_no("16°C", yes_ask=0.50, model_p=0.20, no_ask=0.50)
+    actions = WeatherForecastStrategy().evaluate(_state(
+        [bucket],
+        open_orders={},                 # filled order is no longer "open"
+        held_no={"16°C": 25.0},         # but we hold the resulting position
+    ))
+    no_buys = [a for a in actions
+               if isinstance(a, PlaceLimit) and a.token_side == "NO"
+               and a.side == "BUY"]
+    assert no_buys == []

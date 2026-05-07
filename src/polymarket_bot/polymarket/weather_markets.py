@@ -130,10 +130,16 @@ def discover_open_events(city_keys: list[str], *,
     return events
 
 
-def populate_quotes(event: WeatherEvent, *, client: httpx.Client | None = None) -> int:
+def populate_quotes(event: WeatherEvent, *,
+                    client: httpx.Client | None = None,
+                    fetch_no_book: bool = False) -> int:
     """For each bucket in `event`, fetch its YES order book and fill bid/ask/depth.
 
-    Returns the number of buckets we successfully populated.
+    When `fetch_no_book=True`, also fetches the NO-side book so the strategy
+    can evaluate buying NO on over-priced buckets. Doubles the per-bucket HTTP
+    calls — only enable when the strategy actually uses NO quotes.
+
+    Returns the number of buckets with usable YES quotes.
     """
     own = client is None
     c = client or httpx.Client(timeout=10.0)
@@ -150,6 +156,15 @@ def populate_quotes(event: WeatherEvent, *, client: httpx.Client | None = None) 
                 n_ok += 1
             # Cache the latest observed YES book on the markets row for MTM display.
             update_market_quote(b.market_id, yes_bid, yes_ask)
+
+            if fetch_no_book:
+                no_book = fetch_book(b.no_token_id, client=c)
+                no_bid, no_ask, no_ask_usd = parse_book(no_book)
+                b.no_bid = no_bid
+                b.no_ask = no_ask
+                b.depth_no_ask_usd = no_ask_usd
+                if no_bid is not None and no_ask is not None:
+                    b.no_mid = (no_bid + no_ask) / 2.0
         return n_ok
     finally:
         if own:

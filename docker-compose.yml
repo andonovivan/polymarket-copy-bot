@@ -11,6 +11,10 @@ services:
       # for every city — feeds strategy/calibration.py (per-city bias + isotonic
       # probability calibration). Read-only: never places orders.
       - RESEARCH_ENABLED=1
+      # Run the weather-forecast strategy alongside the bucket-arbitrage
+      # scanner. The arb scanner is model-independent: it buys all 11 buckets
+      # of an event when the YES asks sum to <$0.93, locking in risk-free PnL.
+      - STRATEGY=weather_forecast,bucket_arbitrage
     volumes:
       - bot_state:/app/state
 

@@ -85,6 +85,23 @@ class BotConfig(BaseModel):
                      "production CITY_REGISTRY). Off by default — enable when API quota allows."),
     )
 
+    # --- Bayesian fusion (#4 — observed-temp prior on ensemble forecasts) ---
+    bayesian_fusion_enabled: bool = Field(
+        default=True,
+        description="Sharpen ensemble probabilities by fusing with observed-so-far temps "
+                    "in the hours leading up to resolution.",
+    )
+    bayesian_fusion_within_seconds: int = Field(
+        default=21600,   # 6h
+        description="Only fuse when an event is this close to resolution.",
+    )
+
+    # --- NO-side trades (#2 — buy NO on over-priced buckets) ---
+    no_side_enabled: bool = Field(
+        default=False,
+        description="Also evaluate BUY NO opportunities (doubles populate_quotes API cost).",
+    )
+
     @classmethod
     def from_env(cls) -> BotConfig:
         return cls(
@@ -118,4 +135,7 @@ class BotConfig(BaseModel):
             research_window_seconds=int(os.getenv("RESEARCH_WINDOW_SECONDS", "3600")),
             research_dedupe_seconds=int(os.getenv("RESEARCH_DEDUPE_SECONDS", "600")),
             research_capture_candidates=os.getenv("RESEARCH_CAPTURE_CANDIDATES", "0") == "1",
+            bayesian_fusion_enabled=os.getenv("BAYESIAN_FUSION_ENABLED", "1") == "1",
+            bayesian_fusion_within_seconds=int(os.getenv("BAYESIAN_FUSION_WITHIN_SECONDS", "21600")),
+            no_side_enabled=os.getenv("NO_SIDE_ENABLED", "0") == "1",
         )
