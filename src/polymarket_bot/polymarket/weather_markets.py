@@ -130,42 +130,66 @@ def discover_open_events(city_keys: list[str], *,
     return events
 
 
+def _fetch_one_bucket(b, client: httpx.Client, fetch_no_book: bool) -> bool:
+    """Worker for a single bucket. Returns True iff YES quotes are usable.
+
+    Each worker writes only to its own `Bucket` instance (no contention) and
+    issues one DB upsert via the thread-safe `update_market_quote`.
+    """
+    book = fetch_book(b.yes_token_id, client=client)
+    yes_bid, yes_ask, yes_ask_usd = parse_book(book)
+    b.yes_bid = yes_bid
+    b.yes_ask = yes_ask
+    b.depth_yes_ask_usd = yes_ask_usd
+    yes_ok = yes_bid is not None and yes_ask is not None
+    if yes_ok:
+        b.yes_mid = (yes_bid + yes_ask) / 2.0
+    update_market_quote(b.market_id, yes_bid, yes_ask)
+
+    if fetch_no_book:
+        no_book = fetch_book(b.no_token_id, client=client)
+        no_bid, no_ask, no_ask_usd = parse_book(no_book)
+        b.no_bid = no_bid
+        b.no_ask = no_ask
+        b.depth_no_ask_usd = no_ask_usd
+        if no_bid is not None and no_ask is not None:
+            b.no_mid = (no_bid + no_ask) / 2.0
+    return yes_ok
+
+
 def populate_quotes(event: WeatherEvent, *,
                     client: httpx.Client | None = None,
-                    fetch_no_book: bool = False) -> int:
+                    fetch_no_book: bool = False,
+                    max_workers: int = 20) -> int:
     """For each bucket in `event`, fetch its YES order book and fill bid/ask/depth.
 
     When `fetch_no_book=True`, also fetches the NO-side book so the strategy
     can evaluate buying NO on over-priced buckets. Doubles the per-bucket HTTP
     calls — only enable when the strategy actually uses NO quotes.
 
+    Buckets are fetched concurrently via a `ThreadPoolExecutor` capped at
+    `max_workers`. The shared `httpx.Client` is thread-safe through its
+    connection pool, and `update_market_quote` uses the thread-safe
+    psycopg pool, so no external synchronization is needed.
+
     Returns the number of buckets with usable YES quotes.
     """
     own = client is None
     c = client or httpx.Client(timeout=10.0)
-    n_ok = 0
     try:
-        for b in event.buckets:
-            book = fetch_book(b.yes_token_id, client=c)
-            yes_bid, yes_ask, yes_ask_usd = parse_book(book)
-            b.yes_bid = yes_bid
-            b.yes_ask = yes_ask
-            b.depth_yes_ask_usd = yes_ask_usd
-            if yes_bid is not None and yes_ask is not None:
-                b.yes_mid = (yes_bid + yes_ask) / 2.0
-                n_ok += 1
-            # Cache the latest observed YES book on the markets row for MTM display.
-            update_market_quote(b.market_id, yes_bid, yes_ask)
-
-            if fetch_no_book:
-                no_book = fetch_book(b.no_token_id, client=c)
-                no_bid, no_ask, no_ask_usd = parse_book(no_book)
-                b.no_bid = no_bid
-                b.no_ask = no_ask
-                b.depth_no_ask_usd = no_ask_usd
-                if no_bid is not None and no_ask is not None:
-                    b.no_mid = (no_bid + no_ask) / 2.0
-        return n_ok
+        buckets = list(event.buckets)
+        if not buckets:
+            return 0
+        # Cap workers at the bucket count; spinning extra threads for an
+        # event with 11 buckets is wasteful.
+        workers = max(1, min(max_workers, len(buckets)))
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(
+                lambda b: _fetch_one_bucket(b, c, fetch_no_book),
+                buckets,
+            ))
+        return sum(1 for ok in results if ok)
     finally:
         if own:
             c.close()

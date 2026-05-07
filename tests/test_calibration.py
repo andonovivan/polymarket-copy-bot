@@ -16,6 +16,7 @@ from polymarket_bot.strategy.calibration import (
     compute_city_bias_curve,
     compute_city_calibrator,
     get_city_bias_curve,
+    is_city_warmed_up,
     reset_caches,
 )
 
@@ -245,3 +246,40 @@ def test_apply_calibration_returns_new_dict_with_same_keys(tmp_db):
     assert set(out.keys()) == set(probs.keys())
     for v in out.values():
         assert 0.0 <= v <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Per-city warmup gate
+# ---------------------------------------------------------------------------
+
+def _seed_settled_obs(city_key: str, n: int, outcome: int = 1) -> None:
+    """Insert N rows with a non-null `outcome`, mirroring Path B settlement."""
+    with get_pool().connection() as conn:
+        for i in range(n):
+            conn.execute(
+                "INSERT INTO weather_research_obs "
+                "(city_key, target_date, slug, bucket_label, model_p, "
+                " observed_at, outcome) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (city_key, "2026-04-01", f"slug-warmup-{i}",
+                 "16°C", 0.5, int(time.time()) - i, outcome),
+            )
+
+
+def test_warmup_gate_open_when_min_obs_zero(tmp_db):
+    # min_obs=0 disables the gate — always returns True without DB hit.
+    assert is_city_warmed_up("paris", 0) is True
+
+
+def test_warmup_gate_closed_when_no_data(tmp_db):
+    assert is_city_warmed_up("paris", 10) is False
+
+
+def test_warmup_gate_open_above_threshold(tmp_db):
+    _seed_settled_obs("paris", 12)
+    assert is_city_warmed_up("paris", 10) is True
+
+
+def test_warmup_gate_closed_below_threshold(tmp_db):
+    _seed_settled_obs("paris", 9)
+    assert is_city_warmed_up("paris", 10) is False

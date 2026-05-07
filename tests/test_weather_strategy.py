@@ -242,6 +242,69 @@ def _bucket_with_no(label: str, yes_ask: float, model_p: float,
     return b
 
 
+def test_confidence_dampens_kelly_when_member_std_is_high():
+    # Same bucket, same edge — only the event-level std differs. With std=0
+    # the bet should be larger than with std=4. The 1/(1+std) multiplier
+    # pulls the high-std stake to 1/5 of the low-std stake.
+    # Parameters chosen so Kelly stake stays below max_bet_pct on both sides
+    # (model_p=0.40, ask=0.30 → f_full≈0.143 → 0.25*0.143=3.6% <5% cap).
+    bucket_low = _bucket("19°C", ask=0.30, model_p=0.40, depth=1000.0)
+    state_low = _state([bucket_low], edge_threshold=0.05, bankroll=500.0)
+    state_low.event.member_std = 0.0
+    actions_low = WeatherForecastStrategy().evaluate(state_low)
+
+    bucket_high = _bucket("19°C", ask=0.30, model_p=0.40, depth=1000.0)
+    state_high = _state([bucket_high], edge_threshold=0.05, bankroll=500.0)
+    state_high.event.member_std = 4.0
+    actions_high = WeatherForecastStrategy().evaluate(state_high)
+
+    assert len(actions_low) == 1
+    assert len(actions_high) == 1
+    # Stake = price * size; at the same price the share count tracks stake.
+    assert isinstance(actions_low[0], PlaceLimit)
+    assert isinstance(actions_high[0], PlaceLimit)
+    # 1/(1+0) vs 1/(1+4) = 1.0 vs 0.2. Allow ~10% slack for floor() rounding.
+    ratio = actions_high[0].size / actions_low[0].size
+    assert 0.18 < ratio < 0.22
+
+
+def test_warmup_gate_blocks_buys_but_not_profit_takes(monkeypatch):
+    # When the city is not warmed up, BUYs are skipped but profit-take SELLs
+    # on existing held positions still flow through.
+    monkeypatch.setattr(
+        "polymarket_bot.strategy.calibration.is_city_warmed_up",
+        lambda city, n: False,
+    )
+    # Bucket: edge 0.30 (model_p 0.60 vs ask 0.30) — would normally fire BUY.
+    # Also held 100 shares with bid rich enough to trigger profit-take.
+    held_bucket = _bucket("19°C", ask=0.30, model_p=0.60, bid=0.80, depth=1000.0)
+    held_bucket.yes_bid = 0.80
+    held_bucket.yes_mid = 0.55
+    state = _state([held_bucket], held_yes={"19°C": 100.0})
+    state.warmup_min_obs = 10
+    actions = WeatherForecastStrategy().evaluate(state)
+    sells = [a for a in actions if isinstance(a, PlaceLimit) and a.side == "SELL"]
+    buys = [a for a in actions if isinstance(a, PlaceLimit) and a.side == "BUY"]
+    assert buys == []
+    assert len(sells) == 1
+
+
+def test_warmup_gate_off_when_min_obs_zero(monkeypatch):
+    # warmup_min_obs=0 → gate disabled, BUYs proceed regardless.
+    called = []
+    monkeypatch.setattr(
+        "polymarket_bot.strategy.calibration.is_city_warmed_up",
+        lambda city, n: called.append((city, n)) or False,
+    )
+    bucket = _bucket("19°C", ask=0.30, model_p=0.50, depth=1000.0)
+    state = _state([bucket])
+    state.warmup_min_obs = 0
+    actions = WeatherForecastStrategy().evaluate(state)
+    # gate skipped → is_city_warmed_up never called
+    assert called == []
+    assert len(actions) == 1
+
+
 def test_no_side_buy_when_bucket_overpriced():
     # model_p=0.20 → model_no_p=0.80. Bucket priced rich on YES (ask 0.50)
     # → NO ask should be cheap (~0.50). edge_no = 0.80 − 0.50 = 0.30, fires.

@@ -129,6 +129,16 @@ def _fetch_json(url: str, *, max_retries: int = 3) -> dict | None:
                 logger.warning("ensemble_rate_limited",
                                retry_after_seconds=retry_after,
                                body=body[:120])
+                # Persist to meta so the dashboard can surface the backoff
+                # across all services. In-process flag stays canonical for
+                # short-circuiting; meta is best-effort for visibility.
+                try:
+                    from polymarket_bot.persistence.repo import set_meta
+                    set_meta("forecast_rate_limited_until",
+                             str(int(_RATE_LIMITED_UNTIL)))
+                except Exception as exc:
+                    logger.warning("rate_limit_meta_write_failed",
+                                   error=str(exc)[:160])
                 return None
             if 500 <= exc.code < 600 and attempt < max_retries - 1:
                 time.sleep(delay)
@@ -258,3 +268,10 @@ def bucket_probabilities(members: list[int], labels: list[str]) -> dict[str, flo
         return {label: 0.0 for label in labels}
     n = len(members)
     return {label: sum(1 for t in members if in_bucket(t, label)) / n for label in labels}
+
+
+def bucket_member_counts(members: list[int], labels: list[str]) -> dict[str, int]:
+    """Raw counts of ensemble members per bucket. Sister to bucket_probabilities."""
+    if not members:
+        return {label: 0 for label in labels}
+    return {label: sum(1 for t in members if in_bucket(t, label)) for label in labels}

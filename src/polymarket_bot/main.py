@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import signal
+import statistics
 import sys
 import time
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from polymarket_bot.config import BotConfig
 from polymarket_bot.dashboard.server import start_dashboard
 from polymarket_bot.data.weather_feed import (
     CITY_REGISTRY,
+    bucket_member_counts,
     bucket_probabilities,
     get_ensemble,
 )
@@ -153,16 +155,30 @@ def _attach_model_probabilities(event: WeatherEvent,
                             city=event.city_key, observed=round(observed, 1),
                             n_members_shifted=n_shifted)
 
+    # Ensemble disagreement (population stdev) drives confidence-weighted
+    # Kelly sizing in the strategy layer. Computed after bias + fusion so it
+    # reflects the same distribution we bucketize.
+    event.member_std = statistics.pstdev(members) if len(members) > 1 else 0.0
+
     # Layer 3 — bucket counts.
     labels = [b.label for b in event.buckets]
     probs = bucket_probabilities(members, labels)
+    counts = bucket_member_counts(members, labels)
 
     # Layer 4 — isotonic probability calibration.
     calibrator = get_city_calibrator(event.city_key)
     probs = apply_calibration(probs, calibrator)
 
+    # Tail-bucket flooring: raw counts below threshold are noise; setting
+    # model_p to None makes the strategy skip BUYs without affecting SELLs.
+    min_count = config.min_bucket_member_count if config is not None else 0
     for b in event.buckets:
-        b.model_p = probs.get(b.label, 0.0)
+        c = counts.get(b.label, 0)
+        b.member_count = c
+        if c < min_count:
+            b.model_p = None
+        else:
+            b.model_p = probs.get(b.label, 0.0)
     return len(forecast.members)
 
 
@@ -415,7 +431,8 @@ def _tick(config: BotConfig, cities: list[str], broker: Broker,
         for event in events:
             _persist_event(event)
             n_quoted = populate_quotes(event, client=client,
-                                       fetch_no_book=config.no_side_enabled)
+                                       fetch_no_book=config.no_side_enabled,
+                                       max_workers=config.clob_fetch_concurrency)
             if n_quoted == 0:
                 continue
             seconds_to_res = max(0, event.resolution_ts - int(time.time()))

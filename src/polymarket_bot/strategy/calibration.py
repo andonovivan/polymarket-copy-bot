@@ -62,6 +62,29 @@ DEFAULT_LOOKBACK_DAYS = 30
 # Cache: key → (fitted_at, bias_curve_callable_or_None).
 _BIAS_CACHE: dict[str, tuple[float, "Optional[Callable[[float], float]]"]] = {}
 _CALIBRATOR_CACHE: dict[str, tuple[float, "IsotonicRegression | None"]] = {}
+# Cache: city_key → (fitted_at, settled_obs_count). The DB query is cheap but
+# every strategy tick on every event would still hit it; cache for the same
+# TTL as the calibration fits.
+_WARMUP_COUNT_CACHE: dict[str, tuple[float, int]] = {}
+
+
+def is_city_warmed_up(city_key: str, min_obs: int) -> bool:
+    """True iff the city has at least `min_obs` settled research observations.
+
+    The strategy uses this to gate new BUYs on cities the calibrator hasn't
+    had data to fit yet. Result is cached for `CACHE_TTL_SECONDS` to keep
+    tick-loop overhead negligible.
+    """
+    if min_obs <= 0:
+        return True
+    cached = _WARMUP_COUNT_CACHE.get(city_key)
+    now = time.time()
+    if cached and (now - cached[0]) < CACHE_TTL_SECONDS:
+        return cached[1] >= min_obs
+    from polymarket_bot.persistence.repo import count_settled_obs_for_city
+    count = count_settled_obs_for_city(city_key)
+    _WARMUP_COUNT_CACHE[city_key] = (now, count)
+    return count >= min_obs
 
 
 # ---------------------------------------------------------------------------
@@ -265,3 +288,4 @@ def reset_caches() -> None:
     """Clear the in-memory caches. For tests."""
     _BIAS_CACHE.clear()
     _CALIBRATOR_CACHE.clear()
+    _WARMUP_COUNT_CACHE.clear()

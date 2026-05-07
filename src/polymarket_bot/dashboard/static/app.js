@@ -477,6 +477,51 @@
     return new Set([...chips].map((c) => c.dataset.name));
   }
 
+  // ---------- health banner ----------
+
+  // Renders the alert banner from the /api/dashboard `health` payload.
+  // Hidden when nothing is wrong; shown red when any field is set.
+  function _renderHealthBanner(health) {
+    const banner = document.getElementById("alerts-banner");
+    if (!banner) return;
+    if (!health) {
+      banner.classList.add("hidden");
+      banner.innerHTML = "";
+      return;
+    }
+    const items = [];
+    if (health.halted_at) {
+      const reason = health.halt_reason || "unknown";
+      items.push(`<div class="alert-item">HALTED — ${escapeHtml(reason)}</div>`);
+    }
+    if (health.forecast_rate_limited_until) {
+      const t = new Date(health.forecast_rate_limited_until * 1000);
+      const hh = String(t.getUTCHours()).padStart(2, "0");
+      const mm = String(t.getUTCMinutes()).padStart(2, "0");
+      items.push(`<div class="alert-item">Open-Meteo rate-limited until ${hh}:${mm} UTC</div>`);
+    }
+    const stale = health.stale_services || [];
+    if (stale.length) {
+      const names = stale.map((s) => `${s.service} (${Math.round(s.age_seconds)}s)`).join(", ");
+      items.push(`<div class="alert-item">services stale: ${escapeHtml(names)}</div>`);
+    }
+    if (items.length === 0) {
+      banner.classList.add("hidden");
+      banner.innerHTML = "";
+      return;
+    }
+    banner.innerHTML = items.join("");
+    banner.classList.remove("hidden");
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;");
+  }
+
   // ---------- chart helpers ----------
 
   // Reusable uPlot factory: pass the container, dataset and series spec.
@@ -553,8 +598,10 @@
       : "";
     const data = await api("/api/dashboard" + filterParam).catch(() => ({
       stats_today: {}, totals: {}, inventories: [], open_orders: [],
-      equity_curve: [], daily_pnl: [], strategy_pnl: [],
+      equity_curve: [], daily_pnl: [], strategy_pnl: [], health: null,
     }));
+
+    _renderHealthBanner(data.health);
 
     // Re-render the chip group on every refresh tick so a freshly
     // registered/enabled strategy shows up without a route re-entry.

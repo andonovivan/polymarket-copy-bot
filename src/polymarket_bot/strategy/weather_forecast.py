@@ -61,6 +61,21 @@ class WeatherForecastStrategy(BettingStrategy):
         bankroll = max(state.bankroll, 0.0)
         running_exposure = state.total_open_exposure_usd
         max_total = bankroll * state.max_total_exposure_pct
+        # Confidence multiplier: 1/(1+std). std=0 → 1.0; std=1 → 0.5; std=3 → 0.25.
+        # Dampens Kelly when the ensemble disagrees so we don't overcommit on
+        # high-uncertainty events.
+        member_std = state.event.member_std or 0.0
+        confidence_mult = 1.0 / (1.0 + member_std)
+        # Per-city warmup gate: refuse new BUYs until Path B has captured
+        # enough settled obs for the city. Profit-take SELLs are unaffected
+        # so existing positions still wind down.
+        warmed_up = True
+        if state.warmup_min_obs > 0:
+            from polymarket_bot.strategy.calibration import is_city_warmed_up
+            warmed_up = is_city_warmed_up(state.event.city_key, state.warmup_min_obs)
+            if not warmed_up:
+                logger.debug("weather_skip_warmup", city=state.event.city_key,
+                             min_obs=state.warmup_min_obs)
 
         for b in state.event.buckets:
             # Profit-take FIRST — if we hold this bucket and the bid is rich,
@@ -72,6 +87,8 @@ class WeatherForecastStrategy(BettingStrategy):
                     actions.append(pt)
                 continue   # don't also try to buy more of the same bucket
 
+            if not warmed_up:
+                continue
             if b.model_p is None or b.yes_ask is None:
                 continue
             if not (0.0 < b.yes_ask < 1.0):
@@ -88,7 +105,7 @@ class WeatherForecastStrategy(BettingStrategy):
                 continue
 
             f_full = _kelly_fraction(b.model_p, b.yes_ask)
-            f_use = min(state.kelly_fraction * f_full, state.max_bet_pct)
+            f_use = min(state.kelly_fraction * f_full * confidence_mult, state.max_bet_pct)
             stake = bankroll * f_use
             # Global exposure cap — never commit more than max_total_exposure_pct of bankroll.
             stake = min(stake, max(0.0, max_total - running_exposure))
@@ -124,6 +141,8 @@ class WeatherForecastStrategy(BettingStrategy):
         # market, so iterating again here is cheap and rarely emits extra
         # orders.
         for b in state.event.buckets:
+            if not warmed_up:
+                continue
             if b.model_p is None or b.no_ask is None:
                 continue
             if not (0.0 < b.no_ask < 1.0):
@@ -147,7 +166,7 @@ class WeatherForecastStrategy(BettingStrategy):
                 continue
 
             f_full = _kelly_fraction(no_p, b.no_ask)
-            f_use = min(state.kelly_fraction * f_full, state.max_bet_pct)
+            f_use = min(state.kelly_fraction * f_full * confidence_mult, state.max_bet_pct)
             stake = bankroll * f_use
             stake = min(stake, max(0.0, max_total - running_exposure))
             if stake < MIN_ORDER_NOTIONAL:

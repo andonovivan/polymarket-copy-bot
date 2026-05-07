@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from polymarket_bot.data.weather_feed import bucket_probabilities, in_bucket
+from polymarket_bot.data.weather_feed import (
+    bucket_member_counts,
+    bucket_probabilities,
+    in_bucket,
+)
 
 
 def test_in_bucket_le_threshold():
@@ -45,3 +49,19 @@ def test_bucket_probabilities_partition():
 def test_bucket_probabilities_empty_members_returns_zeros():
     p = bucket_probabilities([], ["20°C", "21°C"])
     assert p == {"20°C": 0.0, "21°C": 0.0}
+
+
+def test_bucket_member_counts_matches_probabilities_times_n():
+    members = [55, 56, 56, 58, 60, 60, 60, 62]
+    labels = ["54-55°F", "56-57°F", "58-59°F", "60-61°F", "62-63°F"]
+    counts = bucket_member_counts(members, labels)
+    assert counts == {"54-55°F": 1, "56-57°F": 2, "58-59°F": 1,
+                      "60-61°F": 3, "62-63°F": 1}
+    # Counts should be probabilities × len(members) — sister functions.
+    probs = bucket_probabilities(members, labels)
+    for label in labels:
+        assert counts[label] == round(probs[label] * len(members))
+
+
+def test_bucket_member_counts_empty_returns_zeros():
+    assert bucket_member_counts([], ["20°C"]) == {"20°C": 0}

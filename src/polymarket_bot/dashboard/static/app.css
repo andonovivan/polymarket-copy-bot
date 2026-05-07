@@ -107,6 +107,23 @@ html, body {
   font-size: 15px; font-weight: 600; margin: 0;
   letter-spacing: -0.01em;
 }
+.alerts-banner {
+  margin: 12px 28px 0;
+  padding: 10px 14px;
+  border-radius: 6px;
+  background: rgba(255, 122, 130, 0.12);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  font-size: 13px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.alerts-banner.hidden { display: none; }
+.alerts-banner .alert-item {
+  display: flex; align-items: center; gap: 8px;
+}
+.alerts-banner .alert-item::before {
+  content: "⚠"; font-size: 14px;
+}
 .status {
   display: flex; align-items: center; gap: 12px;
   font-size: 12.5px; color: var(--text-dim);

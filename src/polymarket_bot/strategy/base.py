@@ -54,6 +54,10 @@ class Bucket:
     yes_mid: float | None
     depth_yes_ask_usd: float             # YES-ask-side liquidity we'd cross
     model_p: float | None = None         # filled by the strategy ctx (None if no forecast)
+    # Raw count of ensemble members landing in this bucket. None when no
+    # forecast was attached. Used by the strategy / runner to suppress trades
+    # on tail buckets where probability mass is below noise threshold.
+    member_count: int | None = None
     # NO-side quotes (for the over-priced-bucket case — sell YES is rare; we
     # buy NO instead, which has the same payoff structure). Populated by
     # populate_quotes from the CLOB NO order book.
@@ -73,6 +77,10 @@ class WeatherEvent:
     resolution_ts: int                   # when actual outcome finalizes (= end_ts)
     unit: Literal["fahrenheit", "celsius"]
     buckets: list[Bucket] = field(default_factory=list)
+    # Population standard deviation across the (bias-corrected) ensemble
+    # members for this event's target day. None when no forecast attached.
+    # The strategy uses it to dampen Kelly sizing when the ensemble disagrees.
+    member_std: float | None = None
 
 
 @dataclass
@@ -111,6 +119,9 @@ class BetState:
     # NO double-entry after a NO BUY fills and is no longer in
     # `open_orders_by_bucket`). Defaulted so existing test fixtures still work.
     held_no_shares_by_bucket: dict[str, float] = field(default_factory=dict)
+    # Per-city warmup gate: if > 0, refuse new BUYs until the city has at
+    # least this many settled weather_research_obs rows. SELLs unaffected.
+    warmup_min_obs: int = 0
 
 
 # ---------------------------------------------------------------------------

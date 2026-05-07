@@ -605,6 +605,17 @@ def set_meta(key: str, value: str) -> None:
         )
 
 
+def meta_keys_with_prefix(prefix: str) -> dict[str, str]:
+    """Return all meta rows whose key starts with `prefix`. Used by the
+    dashboard to discover all `last_running_ts:*` heartbeats at once."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT key, value FROM meta WHERE key LIKE %s",
+            (prefix + "%",),
+        ).fetchall()
+    return {k: v for k, v in rows}
+
+
 # ---------------------------------------------------------------------------
 # Per-strategy enabled flags (Phase A.3) — persisted in the meta table.
 # Stored as a JSON list under `meta['enabled_strategies']`. When the row is
@@ -679,3 +690,19 @@ def forecast_cache_put(city_key: str, target_date: str,
             (city_key, target_date, int(time.time()),
              json.dumps([int(m) for m in members])),
         )
+
+
+def count_settled_obs_for_city(city_key: str) -> int:
+    """How many settled rows in weather_research_obs for this city.
+
+    Powers the per-city warmup gate: the strategy refuses new BUYs until
+    Path B has captured `warmup_min_obs` settled observations, ensuring the
+    bias-correction calibrator has data to fit before any betting.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT count(*) FROM weather_research_obs "
+            "WHERE city_key=%s AND outcome IS NOT NULL",
+            (city_key,),
+        ).fetchone()
+    return int(row[0]) if row else 0

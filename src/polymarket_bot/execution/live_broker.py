@@ -61,6 +61,14 @@ def _handle_clob_failure(context: str, http_status: int | None, message: str | N
     if err.action == "HALT":
         _HALTED = True
         logger.error("clob_halt", **log_kw)
+        # Persist HALT to meta so the dashboard can surface it. The flag
+        # itself is in-process; this row is the cross-service signal.
+        try:
+            from polymarket_bot.persistence.repo import set_meta
+            set_meta("halted_at", str(int(time.time())))
+            set_meta("halt_reason", f"{context}: {err.message[:160]}")
+        except Exception as exc:
+            logger.warning("halt_meta_write_failed", error=str(exc)[:160])
     elif err.action == "RETRY":
         logger.warning("clob_retry", **log_kw)
     else:
@@ -75,6 +83,17 @@ _RETRY_BASE_SLEEP = 1.0
 class LiveBroker(Broker):
     def __init__(self, client: PolymarketClient) -> None:
         self.client = client
+        # Restart implicitly clears any prior HALT signal — the in-process
+        # _HALTED flag starts False on each container, so the meta row would
+        # otherwise lie until manually cleared. We persist as "" (which the
+        # API parses as None) rather than DELETE to keep the meta accessor
+        # surface minimal.
+        try:
+            from polymarket_bot.persistence.repo import set_meta
+            set_meta("halted_at", "")
+            set_meta("halt_reason", "")
+        except Exception as exc:
+            logger.warning("halt_meta_clear_failed", error=str(exc)[:160])
 
     def _place_with_retry(self, action: PlaceLimit) -> dict | None:
         """Call `client.place_order` with bounded retry on RETRY-class errors.

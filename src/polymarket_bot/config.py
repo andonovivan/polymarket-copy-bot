@@ -45,6 +45,32 @@ class BotConfig(BaseModel):
     min_market_depth_usd: float = Field(default=20.0, description="Skip buckets thinner than this")
     lock_buffer_seconds: int = Field(default=600,
                                      description="Stop betting within N seconds of resolution")
+    # Drop tail buckets where only a handful of the 122 ensemble members landed
+    # — those probabilities are statistical noise, not signal. Setting model_p
+    # to None on these buckets short-circuits the strategy's BUY block while
+    # leaving profit-take SELLs untouched.
+    min_bucket_member_count: int = Field(
+        default=6,
+        description="Buckets with raw ensemble counts below this get model_p=None.",
+    )
+    # Per-city warmup gate — refuse new BUYs until Path B has captured this
+    # many settled obs for the city (so calibration's bias correction can fit).
+    # Default 0 = gate disabled. Doesn't gate SELL or CancelOrder.
+    warmup_min_obs: int = Field(
+        default=0,
+        description="Min settled weather_research_obs per city before BUYs are allowed.",
+    )
+    # Concurrency for parallel CLOB book fetches in populate_quotes.
+    clob_fetch_concurrency: int = Field(
+        default=20,
+        description="Max parallel HTTP calls when populating bucket quotes.",
+    )
+    # Random delay (uniform 0..N seconds) at strategy-runner startup, so two
+    # strategy containers don't burst-fetch the same forecasts simultaneously.
+    startup_jitter_seconds: float = Field(
+        default=10.0,
+        description="Max random sleep at strategy-runner startup. 0 disables.",
+    )
 
     # --- Fees ---
     # Polymarket weather markets have feeSchedule.rate=0.05 (5%) on winnings, taker-only.
@@ -98,7 +124,7 @@ class BotConfig(BaseModel):
 
     # --- NO-side trades (#2 — buy NO on over-priced buckets) ---
     no_side_enabled: bool = Field(
-        default=False,
+        default=True,
         description="Also evaluate BUY NO opportunities (doubles populate_quotes API cost).",
     )
 
@@ -137,6 +163,10 @@ class BotConfig(BaseModel):
             max_total_exposure_pct=float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.30")),
             min_market_depth_usd=float(os.getenv("MIN_MARKET_DEPTH_USD", "20")),
             lock_buffer_seconds=int(os.getenv("LOCK_BUFFER_SECONDS", "600")),
+            min_bucket_member_count=int(os.getenv("MIN_BUCKET_MEMBER_COUNT", "6")),
+            warmup_min_obs=int(os.getenv("WARMUP_MIN_OBS", "0")),
+            clob_fetch_concurrency=int(os.getenv("CLOB_FETCH_CONCURRENCY", "20")),
+            startup_jitter_seconds=float(os.getenv("STARTUP_JITTER_SECONDS", "10")),
             winning_fee_bps=int(os.getenv("WINNING_FEE_BPS", "500")),
             equity_sample_seconds=int(os.getenv("EQUITY_SAMPLE_SECONDS", "60")),
             starting_bankroll=float(os.getenv("STARTING_BANKROLL", "100")),
@@ -150,7 +180,7 @@ class BotConfig(BaseModel):
             research_capture_candidates=os.getenv("RESEARCH_CAPTURE_CANDIDATES", "0") == "1",
             bayesian_fusion_enabled=os.getenv("BAYESIAN_FUSION_ENABLED", "1") == "1",
             bayesian_fusion_within_seconds=int(os.getenv("BAYESIAN_FUSION_WITHIN_SECONDS", "21600")),
-            no_side_enabled=os.getenv("NO_SIDE_ENABLED", "0") == "1",
+            no_side_enabled=os.getenv("NO_SIDE_ENABLED", "1") == "1",
             max_order_notional_usd=float(os.getenv("MAX_ORDER_NOTIONAL_USD", "50.0")),
             bankroll_shares={
                 k.removeprefix("BANKROLL_SHARE_").lower(): float(v)

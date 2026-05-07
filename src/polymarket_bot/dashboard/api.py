@@ -12,12 +12,14 @@ from polymarket_bot.persistence.repo import (
     equity_curve,
     get_enabled_strategies,
     get_market,
+    get_meta,
     inventory_snapshot,
     latest_equity,
     list_fills,
     list_settlements,
     markets_bulk,
     markets_with_unsettled_fills,
+    meta_keys_with_prefix,
     set_enabled_strategies,
     settlement_stats,
     strategy_pnl_summary,
@@ -123,6 +125,52 @@ def _build_position_payload() -> dict[str, Any]:
     }
 
 
+STALE_SERVICE_THRESHOLD_SECONDS = 300
+
+
+def _int_or_none(s: str | None) -> int | None:
+    if s is None:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+def build_health_payload(now: int) -> dict[str, Any]:
+    """Surface bot-wide alerts: HALT, forecast rate-limit, stale services.
+
+    Each meta key is best-effort — missing keys mean "never tripped". The
+    dashboard renders a banner when any field is non-null/non-empty.
+    """
+    halted_at = _int_or_none(get_meta("halted_at"))
+    rl_until = _int_or_none(get_meta("forecast_rate_limited_until"))
+    # `forecast_rate_limited_until` only matters while it's still in the
+    # future; surface as None once the backoff window has passed.
+    if rl_until is not None and rl_until <= now:
+        rl_until = None
+    heartbeats = meta_keys_with_prefix("last_running_ts:")
+    stale: list[dict[str, Any]] = []
+    for key, value in heartbeats.items():
+        ts = _int_or_none(value)
+        if ts is None:
+            continue
+        age = now - ts
+        if age > STALE_SERVICE_THRESHOLD_SECONDS:
+            stale.append({
+                "service": key.removeprefix("last_running_ts:"),
+                "age_seconds": age,
+                "last_seen_ts": ts,
+            })
+    stale.sort(key=lambda r: r["age_seconds"], reverse=True)
+    return {
+        "halted_at": halted_at,
+        "halt_reason": get_meta("halt_reason"),
+        "forecast_rate_limited_until": rl_until,
+        "stale_services": stale,
+    }
+
+
 def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) -> tuple[int, Any]:
     if path == "/api/status":
         return 200, {
@@ -169,8 +217,9 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
             for row in all_strategy_pnl
             if not filter_set or row["strategy"] in filter_set
         ]
+        now_ts = int(time.time())
         return 200, {
-            "now": int(time.time()),
+            "now": now_ts,
             "version": VERSION,
             "mode": config.mode if config else "paper",
             "strategy": config.strategy if config else None,
@@ -184,6 +233,7 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
             ],
             "daily_pnl": daily_pnl_summary(days=days, strategies=filter_arg),
             "strategy_pnl": strategy_pnl_filtered,
+            "health": build_health_payload(now_ts),
         }
 
     if path == "/api/equity-curve":

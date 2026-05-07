@@ -89,6 +89,15 @@ def run_strategy_service(strategy_name: str, *, live: bool = False) -> None:
         mode="live" if live else config.mode,
     )
 
+    # Stagger multiple strategy containers so they don't burst-fetch the same
+    # forecasts before the L2 forecast_cache is populated. The first to land
+    # primes the cache; the second reads it for free.
+    if config.startup_jitter_seconds > 0:
+        import random
+        jitter = random.uniform(0, config.startup_jitter_seconds)
+        logger.info("strategy_startup_jitter", seconds=round(jitter, 2))
+        time.sleep(jitter)
+
     while True:
         try:
             _strategy_tick(config, strategy, router, cities)
@@ -128,6 +137,7 @@ def _strategy_tick(config: BotConfig, strategy, router: Router,
             _persist_event(event)
             n_quoted = populate_quotes(
                 event, client=client, fetch_no_book=config.no_side_enabled,
+                max_workers=config.clob_fetch_concurrency,
             )
             if n_quoted == 0:
                 continue
@@ -169,6 +179,7 @@ def _strategy_tick(config: BotConfig, strategy, router: Router,
                 max_total_exposure_pct=config.max_total_exposure_pct,
                 min_market_depth_usd=config.min_market_depth_usd,
                 lockout_seconds=config.lock_buffer_seconds,
+                warmup_min_obs=config.warmup_min_obs,
             )
             actions = strategy.evaluate(state)
             if actions:
