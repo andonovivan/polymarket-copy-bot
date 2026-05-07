@@ -111,11 +111,24 @@ def _fetch_json(url: str, *, max_retries: int = 3) -> dict | None:
                 return json.loads(r.read())
         except urllib.error.HTTPError as exc:
             if exc.code == 429:
+                # Open-Meteo distinguishes minute/hour/day quotas in the
+                # response body. The daily quota only resets at 00:00 UTC,
+                # so a 120s retry just wastes the next call. Sniff the body
+                # and back off to midnight UTC if the message says so.
                 retry_after = float(exc.headers.get("Retry-After")
                                     or RATE_LIMIT_BACKOFF_SECONDS)
+                try:
+                    body = exc.read().decode("utf-8", "replace")
+                except Exception:
+                    body = ""
+                if "Daily" in body or "daily" in body:
+                    now = time.time()
+                    next_utc_midnight = (int(now // 86400) + 1) * 86400
+                    retry_after = max(retry_after, next_utc_midnight - now)
                 _RATE_LIMITED_UNTIL = time.time() + retry_after
                 logger.warning("ensemble_rate_limited",
-                               retry_after_seconds=retry_after)
+                               retry_after_seconds=retry_after,
+                               body=body[:120])
                 return None
             if 500 <= exc.code < 600 and attempt < max_retries - 1:
                 time.sleep(delay)

@@ -132,11 +132,15 @@ def _strategy_tick(config: BotConfig, strategy, router: Router,
             if n_quoted == 0:
                 continue
             seconds_to_res = max(0, event.resolution_ts - int(time.time()))
-            n_members = _attach_model_probabilities(
-                event, seconds_to_resolution=seconds_to_res, config=config,
-            )
-            if n_members == 0:
-                continue
+            # Model-independent strategies (e.g. bucket_arbitrage) skip the
+            # Open-Meteo fetch entirely — saves API quota and lets them keep
+            # running even when the ensemble endpoint is rate-limited or down.
+            if strategy.needs_model_probabilities:
+                n_members = _attach_model_probabilities(
+                    event, seconds_to_resolution=seconds_to_res, config=config,
+                )
+                if n_members == 0:
+                    continue
 
             strat_snapshot = inventory_snapshot_for(strategy.name, all_market_ids)
             exposure_now = sum(

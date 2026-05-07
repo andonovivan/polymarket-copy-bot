@@ -123,6 +123,11 @@ class BettingStrategy(ABC):
 
     name: str = "abstract"           # registry key, never user-facing
     display_name: str = "Abstract"   # human-readable label for the dashboard
+    # Set False on strategies that don't read bucket.model_p — the runner can
+    # then skip the Open-Meteo fetch entirely, halving API traffic and
+    # letting model-independent strategies (e.g. bucket_arbitrage) keep
+    # running through Open-Meteo outages / rate-limit windows.
+    needs_model_probabilities: bool = True
 
     @abstractmethod
     def evaluate(self, state: BetState) -> list[OrderAction]: ...

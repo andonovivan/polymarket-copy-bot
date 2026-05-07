@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# polymarket-bot — thin wrapper around the dev/ops verbs we use most often.
+# Usage: ./develop <verb> [args]   (run `./develop help` for the full list)
+
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+VERB="${1:-help}"
+shift || true
+
+# psql exec helper — used by `psql` and `wipe`. Stays close to the DB
+# credentials baked into docker-compose.yml.
+PG_EXEC=(docker compose exec -T postgres psql -U polymarket_bot -d polymarket_bot)
+
+case "$VERB" in
+  up)
+    # Build (only if Dockerfile/source changed) and start everything in
+    # the background. Pass a service name to start just one.
+    docker compose up -d --build "$@"
+    ;;
+
+  down)
+    # Stop + remove containers, keep the pg_data volume. Default for
+    # "I'm done for now" — paper data and equity curve survive.
+    docker compose down "$@"
+    ;;
+
+  restart)
+    # Force-recreate one or all services. Useful after editing Python
+    # source (the image rebuild will catch the change).
+    docker compose up -d --build --force-recreate "$@"
+    ;;
+
+  logs)
+    # Tail logs from one service or all of them. `-f` follows.
+    docker compose logs -f --tail=200 "$@"
+    ;;
+
+  ps|status)
+    # Quick health-check view across all services.
+    docker compose ps "$@"
+    ;;
+
+  psql)
+    # Drop into psql against the bot's database. Pass extra args after,
+    # e.g. `./develop psql -c "SELECT count(*) FROM fills"`.
+    if [[ -t 0 ]]; then
+      # Interactive — keep the TTY so psql gives a prompt.
+      docker compose exec postgres psql -U polymarket_bot -d polymarket_bot "$@"
+    else
+      "${PG_EXEC[@]}" "$@"
+    fi
+    ;;
+
+  test)
+    # Run pytest from the venv (uses the testcontainer Postgres, not the
+    # docker-compose one — no need to have the stack running).
+    .venv/bin/pytest -q "$@"
+    ;;
+
+  preflight)
+    # Live-mode safety checks (Phase D.5). Run before flipping --live.
+    .venv/bin/polymarket-bot preflight "$@"
+    ;;
+
+  wipe)
+    # Nuclear option — drops the pg_data volume so the next `up` starts
+    # with an empty DB. Confirms first because paper history is gone.
+    echo "This destroys the pg_data volume — equity curve, fills, settlements."
+    read -rp "Type 'wipe' to confirm: " confirm
+    if [[ "$confirm" == "wipe" ]]; then
+      docker compose down -v
+    else
+      echo "Cancelled."
+      exit 1
+    fi
+    ;;
+
+  shell)
+    # Open a bash shell inside a running service container (default:
+    # dashboard). Useful for poking at the installed package.
+    SERVICE="${1:-dashboard}"
+    docker compose exec "$SERVICE" /bin/bash
+    ;;
+
+  help|-h|--help)
+    cat <<'EOF'
+polymarket-bot — dev/ops wrapper
+
+Usage: ./develop <verb> [args]
+
+Verbs:
+  up [service]        Build and start (background). All services if omitted.
+  down                Stop + remove containers; KEEP pg_data volume.
+  restart [service]   Force-recreate one or all services (rebuild + replace).
+  logs [service]      Tail logs (`-f`, last 200 lines). All if omitted.
+  ps | status         Show container status.
+  psql [args…]        Open psql against the bot DB. Extra args forwarded.
+  test [args…]        Run pytest from the venv (uses testcontainer Postgres).
+  preflight           Run live-mode safety checks.
+  wipe                DROP the pg_data volume (asks for 'wipe' confirmation).
+  shell [service]     Open a bash inside a running container (default: dashboard).
+  help                This message.
+
+Examples:
+  ./develop up
+  ./develop logs strategy-weather
+  ./develop psql -c "SELECT count(*) FROM fills"
+  ./develop restart orders-watcher
+EOF
+    ;;
+
+  *)
+    echo "unknown verb: $VERB" >&2
+    echo "run './develop help' for the list of verbs." >&2
+    exit 2
+    ;;
+esac
