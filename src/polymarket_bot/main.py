@@ -238,9 +238,11 @@ def _repair_equity_curve(config: BotConfig) -> None:
          past 2× cost; once we see that we know the curve is contaminated.
     """
     from polymarket_bot.persistence.repo import get_meta, set_meta
-    from polymarket_bot.persistence.schema import get_conn
-    conn = get_conn()
-    rows = conn.execute("SELECT ts, equity FROM equity_curve ORDER BY ts").fetchall()
+    from polymarket_bot.persistence.schema import get_pool
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT ts, equity FROM equity_curve ORDER BY ts"
+        ).fetchall()
     stored_version = get_meta("equity_curve_version")
     version_bumped = stored_version != EQUITY_CURVE_VERSION
 
@@ -260,8 +262,8 @@ def _repair_equity_curve(config: BotConfig) -> None:
         return
 
     seed_ts = rows[0][0] if rows else int(time.time())
-    conn.execute("DELETE FROM equity_curve WHERE ts > ?", (seed_ts,))
-    conn.commit()
+    with get_pool().connection() as conn:
+        conn.execute("DELETE FROM equity_curve WHERE ts > %s", (seed_ts,))
     set_meta("equity_curve_version", EQUITY_CURVE_VERSION)
     logger.warning(
         "equity_curve_repaired",
@@ -335,7 +337,7 @@ def cmd_run(config: BotConfig, args: argparse.Namespace) -> None:
     if (config.mode == "live" or args.live) and config.private_key:
         from polymarket_bot.execution.live_broker import sync_wallet_balance
         live_client = PolymarketClient(config)
-        synced = sync_wallet_balance(live_client)
+        synced = sync_wallet_balance(live_client, config.starting_bankroll)
         if synced is not None:
             logger.info("live_bankroll_set", usdc=round(synced, 4))
     # Multi-strategy support: each name in `config.strategy` (comma-separated)
@@ -344,7 +346,11 @@ def cmd_run(config: BotConfig, args: argparse.Namespace) -> None:
     # "primary" strategy reported on the dashboard.
     names = [n.strip() for n in config.strategy.split(",") if n.strip()]
     strategies = [get_strategy_class(n)() for n in names]
-    routers = {s.name: Router(broker, s.name) for s in strategies}
+    routers = {
+        s.name: Router(broker, s.name,
+                       max_notional_usd=config.max_order_notional_usd)
+        for s in strategies
+    }
     cities = [c.strip() for c in config.weather_cities.split(",") if c.strip()]
     cities = [c for c in cities if c in CITY_REGISTRY]
     if not cities:
@@ -383,7 +389,7 @@ def cmd_run(config: BotConfig, args: argparse.Namespace) -> None:
         # Periodic live wallet reconciliation (every 5 min).
         if live_client is not None and int(time.time()) - last_wallet_sync >= 300:
             from polymarket_bot.execution.live_broker import sync_wallet_balance
-            sync_wallet_balance(live_client)
+            sync_wallet_balance(live_client, config.starting_bankroll)
             last_wallet_sync = int(time.time())
 
         set_meta("last_running_ts", str(int(time.time())))
@@ -399,12 +405,11 @@ def _tick(config: BotConfig, cities: list[str], broker: Broker,
         logger.debug("no_open_events")
     bankroll = latest_equity() or config.starting_bankroll
 
-    # One inventory pull per tick covers BetState construction (held_yes,
-    # held_no, total exposure) for every event × every strategy. Replaces
-    # the previous N+1 pattern of one inventory_for_market call per bucket
-    # per strategy.
+    # Phase C.4 — per-strategy bankroll slicing means each strategy needs
+    # its OWN inventory snapshot (filtered by `fills.strategy`). We query
+    # one snapshot per (strategy × tick) inside the loop below; the
+    # market_ids list is shared across strategies.
     all_market_ids = [b.market_id for ev in events for b in ev.buckets]
-    inv_snapshot = inventory_snapshot(all_market_ids) if all_market_ids else {}
 
     with httpx.Client(timeout=10.0) as client:
         for event in events:
@@ -419,21 +424,38 @@ def _tick(config: BotConfig, cities: list[str], broker: Broker,
             )
             if n_members == 0:
                 continue
-            held_yes = _held_yes_shares_by_bucket(event, inv_snapshot)
-            held_no = _held_no_shares_by_bucket(event, inv_snapshot)
             for strategy in strategies:
-                # Recompute exposure for each strategy so earlier strategies'
-                # bets in this tick already count toward the cap. Uses the
-                # snapshot (zero SQL); freshly-placed orders haven't filled
-                # yet so the snapshot is still accurate within the tick.
-                exposure_now = _total_open_exposure_usd(inv_snapshot)
+                # Per-strategy bankroll slice (Phase C.4). Each strategy
+                # operates against `total_equity * BANKROLL_SHARE_<NAME>`
+                # so two strategies can co-exist without competing for the
+                # same exposure pool. Defaults to 1/N if not set.
+                share = config.strategy_share(strategy.name)
+                strat_bankroll = bankroll * share
+                # Per-strategy exposure: only this strategy's fills count
+                # toward its cap, computed from the snapshot scoped by the
+                # strategy column.
+                from polymarket_bot.persistence.repo import inventory_snapshot_for
+                strat_snapshot = inventory_snapshot_for(
+                    strategy.name, all_market_ids,
+                )
+                exposure_now = sum(
+                    yes * avg_yes for (yes, _, avg_yes, _) in strat_snapshot.values()
+                )
+                strat_held_yes = {
+                    b.label: strat_snapshot.get(b.market_id, _EMPTY_INV)[0]
+                    for b in event.buckets
+                }
+                strat_held_no = {
+                    b.label: strat_snapshot.get(b.market_id, _EMPTY_INV)[1]
+                    for b in event.buckets
+                }
                 state = BetState(
                     event=event,
-                    bankroll=bankroll,
+                    bankroll=strat_bankroll,
                     seconds_to_resolution=seconds_to_res,
                     open_orders_by_bucket=_open_orders_by_bucket(event),
-                    held_yes_shares_by_bucket=held_yes,
-                    held_no_shares_by_bucket=held_no,
+                    held_yes_shares_by_bucket=strat_held_yes,
+                    held_no_shares_by_bucket=strat_held_no,
                     total_open_exposure_usd=exposure_now,
                     edge_threshold=config.edge_threshold,
                     kelly_fraction=config.kelly_fraction,
@@ -476,15 +498,15 @@ def _tick(config: BotConfig, cities: list[str], broker: Broker,
 def _settle_due_events(strategy_name: str, *, winning_fee_bps: int = 500) -> None:
     """Find DB markets whose resolution has passed and that we have fills on,
     group by event slug, ask gamma for the outcome, settle all buckets in one pass."""
-    from polymarket_bot.persistence.schema import get_conn
-    conn = get_conn()
+    from polymarket_bot.persistence.schema import get_pool
     now = int(time.time())
-    rows = conn.execute(
-        "SELECT m.market_id, m.slug, m.resolution_ts, m.yes_token_id, m.no_token_id "
-        "FROM markets m WHERE m.outcome IS NULL AND m.resolution_ts <= ? "
-        "AND EXISTS (SELECT 1 FROM fills f WHERE f.market_id=m.market_id) ",
-        (now,),
-    ).fetchall()
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT m.market_id, m.slug, m.resolution_ts, m.yes_token_id, m.no_token_id "
+            "FROM markets m WHERE m.outcome IS NULL AND m.resolution_ts <= %s "
+            "AND EXISTS (SELECT 1 FROM fills f WHERE f.market_id=m.market_id) ",
+            (now,),
+        ).fetchall()
     if not rows:
         return
     # Markets are stored per bucket; the slug carries `<event_slug>::<bucket_label>`.
@@ -528,6 +550,37 @@ def main() -> None:
     sub.add_parser("redemptions",
                    help="List winning YES positions that still need to be redeemed for USDC.")
 
+    sub.add_parser(
+        "preflight",
+        help="Run live-mode safety checks (Phase D.5): wallet balance, USDC "
+             "allowance, signing key, gamma reachability. Refuses to proceed "
+             "if any check fails. Run before flipping --live for the first time.",
+    )
+
+    p_strat = sub.add_parser(
+        "strategy",
+        help="Run a single strategy in its own tick loop (Phase C). Used by "
+             "the per-strategy docker-compose containers. The orders-watcher "
+             "service handles fills/settlement separately.",
+    )
+    p_strat.add_argument("name",
+                         help="Registry key, e.g. 'weather_forecast' or "
+                              "'bucket_arbitrage'.")
+    p_strat.add_argument("--live", action="store_true")
+
+    p_watch = sub.add_parser(
+        "orders-watcher",
+        help="Run the orders-watcher service (Phase C). Polls open orders, "
+             "writes fills, and settles resolved events. Single-instance.",
+    )
+    p_watch.add_argument("--live", action="store_true")
+
+    sub.add_parser(
+        "dashboard",
+        help="Run the dashboard HTTP server only (Phase C). No trading; "
+             "read-only on the DB.",
+    )
+
     p_bw = sub.add_parser(
         "backtest-weather",
         help="Rank candidate weather cities by historical model-vs-market edge.",
@@ -555,8 +608,125 @@ def main() -> None:
         "run": cmd_run,
         "redemptions": _wrap_with_init(cmd_redemptions),
         "backtest-weather": _cmd_backtest_weather,
+        "preflight": _cmd_preflight,
+        "strategy": _cmd_strategy_service,
+        "orders-watcher": _cmd_orders_watcher,
+        "dashboard": _cmd_dashboard,
     }
     DISPATCH[args.cmd](config, args)
+
+
+def _cmd_strategy_service(config: BotConfig, args: argparse.Namespace) -> None:
+    """Phase C: run a single strategy in its own tick loop."""
+    from polymarket_bot.services.strategy_runner import run_strategy_service
+    run_strategy_service(args.name, live=args.live)
+
+
+def _cmd_orders_watcher(config: BotConfig, args: argparse.Namespace) -> None:
+    """Phase C: run the orders-watcher service (single instance)."""
+    from polymarket_bot.services.orders_watcher import run_orders_watcher_service
+    run_orders_watcher_service(live=args.live)
+
+
+def _cmd_dashboard(config: BotConfig, args: argparse.Namespace) -> None:
+    """Phase C: run the dashboard HTTP server only."""
+    from polymarket_bot.services.dashboard_runner import run_dashboard_service
+    run_dashboard_service()
+
+
+def _cmd_preflight(config: BotConfig, args: argparse.Namespace) -> None:
+    """Live-mode safety checks (Phase D.5).
+
+    Each check is independent and reports OK / FAIL with a one-liner.
+    Exits non-zero if any FAIL. Designed to be run manually before the
+    operator sets `POLYMARKET_BOT_LIVE=1` for the first time, and re-run
+    whenever the wallet, allowance, or key configuration changes.
+    """
+    import sys
+
+    import httpx
+
+    from polymarket_bot.polymarket.client import PolymarketClient
+    from polymarket_bot.polymarket.markets import GAMMA_API_URL
+
+    failures: list[str] = []
+
+    def _ok(name: str, detail: str) -> None:
+        print(f"  ✓ {name:<28} {detail}")
+
+    def _fail(name: str, detail: str) -> None:
+        failures.append(name)
+        print(f"  ✗ {name:<28} {detail}")
+
+    print("polymarket-bot preflight")
+    print("=" * 56)
+
+    # 1. Required config
+    print("\n[config]")
+    if not config.private_key:
+        _fail("PRIVATE_KEY", "missing — set in .env to use --live")
+    else:
+        _ok("PRIVATE_KEY", "present")
+    if config.chain_id != 137:
+        _fail("CHAIN_ID", f"expected 137 (Polygon mainnet), got {config.chain_id}")
+    else:
+        _ok("CHAIN_ID", "137 (Polygon mainnet)")
+    _ok("CLOB_API_URL", config.clob_api_url)
+
+    # 2. Gamma reachability — pulls a tiny dummy event listing.
+    print("\n[gamma reachability]")
+    try:
+        with httpx.Client(timeout=8.0) as c:
+            r = c.get(f"{GAMMA_API_URL}/events", params={"limit": 1})
+            r.raise_for_status()
+        _ok("gamma /events", f"HTTP {r.status_code}")
+    except Exception as exc:
+        _fail("gamma /events", f"{type(exc).__name__}: {str(exc)[:80]}")
+
+    # 3. CLOB connection + balance + allowance — only if we have a key.
+    if config.private_key:
+        print("\n[clob]")
+        try:
+            client = PolymarketClient(config)
+            balance = client.get_balance_usdc()
+            allowance = client.get_usdc_allowance()
+        except Exception as exc:
+            _fail("clob.connect", f"{type(exc).__name__}: {str(exc)[:80]}")
+            balance = allowance = None
+
+        if balance is None:
+            _fail("USDC balance", "fetch failed — check key and chain id")
+        else:
+            _ok("USDC balance", f"${balance:.4f}")
+
+        if allowance is None:
+            _fail("USDC allowance", "fetch failed")
+        elif allowance < 1.0:
+            _fail(
+                "USDC allowance",
+                f"${allowance:.4f} — call clob.update_balance_allowance(...) "
+                "before placing live orders",
+            )
+        else:
+            _ok("USDC allowance", f"${allowance:.4f}")
+
+    # 4. Risk caps sanity
+    print("\n[risk caps]")
+    cap = config.max_order_notional_usd
+    if cap <= 0:
+        _fail("MAX_ORDER_NOTIONAL_USD", "must be > 0")
+    else:
+        _ok("MAX_ORDER_NOTIONAL_USD", f"${cap:.2f}")
+    _ok("MAX_BET_PCT", f"{config.max_bet_pct * 100:.1f}%")
+    _ok("MAX_TOTAL_EXPOSURE_PCT", f"{config.max_total_exposure_pct * 100:.1f}%")
+    _ok("KELLY_FRACTION", f"{config.kelly_fraction:.2f}")
+    _ok("LOCK_BUFFER_SECONDS", f"{config.lock_buffer_seconds}s")
+
+    print()
+    if failures:
+        print(f"FAILED: {len(failures)} check(s) — {', '.join(failures)}")
+        sys.exit(1)
+    print("All checks passed. Safe to set POLYMARKET_BOT_LIVE=1 and run with --live.")
 
 
 def _cmd_backtest_weather(config: BotConfig, args: argparse.Namespace) -> None:

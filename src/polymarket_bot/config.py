@@ -102,6 +102,19 @@ class BotConfig(BaseModel):
         description="Also evaluate BUY NO opportunities (doubles populate_quotes API cost).",
     )
 
+    # --- Live-mode safety cap (Phase D.6) ---
+    max_order_notional_usd: float = Field(
+        default=50.0,
+        description="Hard cap on a single order's price × size, enforced at the Router. "
+                    "Catches fat-finger / config bugs before the order hits the CLOB.",
+    )
+
+    # --- Per-strategy bankroll slicing (Phase C.4) ---
+    # Loaded as a dict from BANKROLL_SHARE_<UPPER_NAME> env vars (e.g.
+    # BANKROLL_SHARE_WEATHER_FORECAST=0.7). Defaults to 1/N for the N
+    # currently-registered strategies — used by `strategy_share()` below.
+    bankroll_shares: dict[str, float] = Field(default_factory=dict)
+
     @classmethod
     def from_env(cls) -> BotConfig:
         return cls(
@@ -138,4 +151,25 @@ class BotConfig(BaseModel):
             bayesian_fusion_enabled=os.getenv("BAYESIAN_FUSION_ENABLED", "1") == "1",
             bayesian_fusion_within_seconds=int(os.getenv("BAYESIAN_FUSION_WITHIN_SECONDS", "21600")),
             no_side_enabled=os.getenv("NO_SIDE_ENABLED", "0") == "1",
+            max_order_notional_usd=float(os.getenv("MAX_ORDER_NOTIONAL_USD", "50.0")),
+            bankroll_shares={
+                k.removeprefix("BANKROLL_SHARE_").lower(): float(v)
+                for k, v in os.environ.items()
+                if k.startswith("BANKROLL_SHARE_")
+            },
         )
+
+    def strategy_share(self, strategy_name: str) -> float:
+        """Return the bankroll fraction allocated to `strategy_name`.
+
+        Looks up `BANKROLL_SHARE_<UPPER_NAME>` first; falls back to 1/N
+        where N is the number of registered strategies. Caller multiplies
+        the bot's current equity by this share before calling
+        `strategy.evaluate(BetState)`.
+        """
+        explicit = self.bankroll_shares.get(strategy_name.lower())
+        if explicit is not None:
+            return max(0.0, min(1.0, explicit))
+        from polymarket_bot.strategy.registry import list_strategies
+        all_names = list_strategies() or [strategy_name]
+        return 1.0 / len(all_names)

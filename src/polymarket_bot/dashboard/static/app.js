@@ -287,8 +287,22 @@
   ];
 
   const STRATEGY_COLS = [
-    { key: "name",    label: "Name",    format: (r) => esc(r.name) },
-    { key: "enabled", label: "Enabled", format: (r) => (r.enabled ? "✓" : "") },
+    {
+      key: "display_name", label: "Name",
+      format: (r) =>
+        `<div>${esc(r.display_name || r.name)}</div>` +
+        `<div class="strategy-name-key">${esc(r.name)}</div>`,
+      sortKey: (r) => (r.display_name || r.name).toLowerCase(),
+    },
+    {
+      key: "enabled", label: "Enabled",
+      // Rendered as a checkbox; the Strategies page attaches a delegated
+      // change handler that POSTs /api/strategies/enabled.
+      format: (r) =>
+        `<input type="checkbox" class="strategy-toggle" ` +
+        `data-name="${esc(r.name)}"${r.enabled ? " checked" : ""}>`,
+      sortKey: (r) => (r.enabled ? 1 : 0),
+    },
   ];
 
   // ===========================================================================
@@ -338,8 +352,64 @@
     _fillsPageTable = _settlementsPageTable = _strategiesTable = null;
   }
 
+  // ---- dashboard strategy filter ----
+
+  const FILTER_KEY = "dashboard.strategy_filter";
+
+  // Load the user's saved filter set (set of strategy names). Empty set
+  // means "no override" — the API will fall back to the enabled set.
+  function _loadFilter() {
+    try {
+      const raw = localStorage.getItem(FILTER_KEY);
+      if (raw == null) return null;   // never set → use server default
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? new Set(arr) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function _saveFilter(set) {
+    try {
+      localStorage.setItem(FILTER_KEY, JSON.stringify([...set]));
+    } catch {
+      /* localStorage disabled — silently degrade */
+    }
+  }
+
+  // Called from the Strategies page after a toggle: if the user's filter
+  // currently matches the previous-enabled set, slide it to track the new
+  // enabled set so the dashboard naturally hides what they just disabled.
+  function _refreshDashboardFilterFromEnabled(newEnabled) {
+    _saveFilter(new Set(newEnabled));
+    // If the dashboard skeleton is already mounted, redraw the chips and
+    // refresh the data.
+    if (_dashboardBuilt) {
+      _renderFilterChips();
+      refreshDashboardData().catch(() => {});
+    }
+  }
+
+  function _renderFilterChips() {
+    const el = $("#strategy-filter");
+    if (!el) return;
+    api("/api/strategies").then((d) => {
+      const filter = _loadFilter();
+      const html = (d.strategies || []).map((s) => {
+        const active = filter == null ? s.enabled : filter.has(s.name);
+        return `<button type="button" class="chip${active ? " active" : ""}" ` +
+          `data-name="${esc(s.name)}">${esc(s.display_name || s.name)}</button>`;
+      }).join("");
+      setHTMLIfChanged(el, html);
+    }).catch(() => {});
+  }
+
   function buildDashboardSkeleton() {
     $("#page").innerHTML = `
+      <div class="strategy-filter-bar">
+        <span class="strategy-filter-label">Show:</span>
+        <div id="strategy-filter" class="chip-group"></div>
+      </div>
       <div class="cards">
         <div class="card"><h3>Equity</h3><div class="value" id="m-equity">—</div><div class="sub">latest</div></div>
         <div class="card"><h3>Unrealized P&L</h3><div class="value" id="m-unreal">—</div><div class="sub" id="m-unreal-sub">—</div></div>
@@ -360,15 +430,9 @@
           <div id="winrate-chart" style="height: 200px;"></div>
         </div>
       </div>
-      <div class="charts-row">
-        <div class="section section-half">
-          <h2 class="section-title">Inventory by city</h2>
-          <div id="inventory-by-city" class="bar-list"></div>
-        </div>
-        <div class="section section-half">
-          <h2 class="section-title">P&L by strategy</h2>
-          <div id="strategy-pnl" class="bar-list"></div>
-        </div>
+      <div class="section">
+        <h2 class="section-title">P&L by strategy</h2>
+        <div id="strategy-pnl" class="bar-list"></div>
       </div>
       <div class="section">
         <h2 class="section-title">Current inventory</h2>
@@ -391,6 +455,26 @@
       emptyText: "No open orders.",
       initialSort: { key: "placed_at", dir: "desc" },
     });
+    // Populate the filter chips and wire click → toggle.
+    _renderFilterChips();
+    $("#strategy-filter").addEventListener("click", (e) => {
+      const chip = e.target.closest(".chip");
+      if (!chip) return;
+      const filter = _loadFilter() || _enabledFromCachedChips();
+      const name = chip.dataset.name;
+      if (filter.has(name)) filter.delete(name);
+      else filter.add(name);
+      _saveFilter(filter);
+      _renderFilterChips();
+      refreshDashboardData().catch(() => {});
+    });
+  }
+
+  // Read the chip group's current visual state (active class) — used as a
+  // fallback when localStorage hasn't been initialised yet.
+  function _enabledFromCachedChips() {
+    const chips = document.querySelectorAll("#strategy-filter .chip.active");
+    return new Set([...chips].map((c) => c.dataset.name));
   }
 
   // ---------- chart helpers ----------
@@ -457,22 +541,25 @@
     setHTMLIfChanged(container, html);
   }
 
-  // Parse the city out of a bucket title like "Paris · May 7 · 14°C".
-  function _cityFromTitle(title) {
-    if (!title) return "?";
-    const i = title.indexOf("·");
-    return (i >= 0 ? title.slice(0, i) : title).trim();
-  }
-
   // ---------- main refresh ----------
 
   async function refreshDashboardData() {
     // Single bundled fetch replacing the 4 parallel calls of the old
     // implementation. See dashboard/api.py:dispatch_get("/api/dashboard").
-    const data = await api("/api/dashboard").catch(() => ({
+    // ?strategies= filter is appended when the user has narrowed the chips.
+    const filter = _loadFilter();
+    const filterParam = filter && filter.size > 0
+      ? "?strategies=" + [...filter].map(encodeURIComponent).join(",")
+      : "";
+    const data = await api("/api/dashboard" + filterParam).catch(() => ({
       stats_today: {}, totals: {}, inventories: [], open_orders: [],
       equity_curve: [], daily_pnl: [], strategy_pnl: [],
     }));
+
+    // Re-render the chip group on every refresh tick so a freshly
+    // registered/enabled strategy shows up without a route re-entry.
+    // _renderFilterChips() is idempotent and reads from /api/strategies.
+    _renderFilterChips();
 
     const stats = data.stats_today || {};
     const totals = data.totals || {};
@@ -571,41 +658,9 @@
         '<div class="empty">Need ≥2 days of settlements.</div>');
     }
 
-    // ---- inventory by city ----
-    // Track priced cost separately from total cost, so a city with no live
-    // quotes shows "—" for unrealized rather than a phantom -$cost loss.
-    const invByCity = {};
-    for (const inv of (data.inventories || [])) {
-      const city = _cityFromTitle(inv.title);
-      if (!invByCity[city]) {
-        invByCity[city] = { cost: 0, priced_cost: 0, mtm: 0, n: 0 };
-      }
-      invByCity[city].cost += inv.cost || 0;
-      invByCity[city].n += 1;
-      if (inv.mtm_value != null) {
-        invByCity[city].priced_cost += inv.cost || 0;
-        invByCity[city].mtm += inv.mtm_value;
-      }
-    }
-    const cityRows = Object.entries(invByCity)
-      .sort((a, b) => b[1].cost - a[1].cost)
-      .map(([city, agg]) => {
-        const upnl = agg.priced_cost > 0 ? agg.mtm - agg.priced_cost : null;
-        const upnlText = upnl == null
-          ? "—"
-          : (upnl >= 0 ? "+" : "") + fmtUsd(upnl);
-        return {
-          label: `${city} (${agg.n})`,
-          barValue: agg.cost,
-          valueText: `${fmtUsd(agg.cost)} · ${upnlText}`,
-        };
-      });
-    _renderBarList($("#inventory-by-city"), cityRows,
-      { emptyText: "Flat — no positions." });
-
     // ---- P&L by strategy ----
     const stratRows = (data.strategy_pnl || []).map((s) => ({
-      label: `${s.strategy} (${s.n_settlements})`,
+      label: `${s.display_name || s.strategy} (${s.n_settlements})`,
       barValue: s.pnl,
       valueText: `${s.pnl >= 0 ? "+" : ""}${fmtUsd(s.pnl)} · ${s.n_wins}W`,
     }));
@@ -660,6 +715,37 @@
     });
   }
 
+  async function _toggleStrategyEnabled(name, becomingEnabled) {
+    // Snapshot the current set, mutate, POST.
+    const data = await api("/api/strategies").catch(() => ({ strategies: [] }));
+    const current = new Set((data.strategies || [])
+      .filter((s) => s.enabled).map((s) => s.name));
+    if (becomingEnabled) current.add(name);
+    else current.delete(name);
+    // Network errors land in catch; non-2xx responses are inspected on the
+    // returned object (no throw-then-catch dance).
+    let r = null;
+    try {
+      r = await fetch("/api/strategies/enabled", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ names: [...current] }),
+      });
+    } catch (e) {
+      console.error("strategy toggle failed (network):", e);
+    }
+    if (r && !r.ok) {
+      console.error("strategy toggle failed (HTTP):", r.status);
+    }
+    // Refresh whichever surfaces depend on the enabled set.
+    if (_strategiesTable) {
+      const fresh = await api("/api/strategies").catch(() => ({ strategies: [] }));
+      _strategiesTable.setRows(fresh.strategies || []);
+    }
+    // Push the new enabled set into the dashboard's filter state too.
+    _refreshDashboardFilterFromEnabled([...current]);
+  }
+
   async function pageStrategies() {
     setText("#page-title", "Strategies");
     const data = await api("/api/strategies").catch(() => ({ strategies: [] }));
@@ -669,11 +755,18 @@
       return;
     }
     $("#page").innerHTML = `<div class="section"><div id="strategies-table"></div></div>`;
-    _strategiesTable = new Table($("#strategies-table"), {
+    const tableEl = $("#strategies-table");
+    _strategiesTable = new Table(tableEl, {
       columns: STRATEGY_COLS,
       emptyText: "No strategies registered.",
       initialSort: { key: "enabled", dir: "desc" },
       initialRows: data.strategies || [],
+    });
+    // Delegated change handler — toggling any checkbox fires the POST.
+    tableEl.addEventListener("change", (e) => {
+      const cb = e.target.closest(".strategy-toggle");
+      if (!cb) return;
+      _toggleStrategyEnabled(cb.dataset.name, cb.checked);
     });
   }
 

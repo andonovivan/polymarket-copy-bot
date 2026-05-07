@@ -25,3 +25,19 @@ def get_strategy_class(name: str) -> type[BettingStrategy]:
 
 def list_strategies() -> list[str]:
     return sorted(_REGISTRY)
+
+
+def get_display_name(name: str) -> str:
+    """Human-readable label for a strategy name, falling back to the raw key
+    when the strategy is no longer registered (e.g., legacy fills.strategy
+    values from an old build)."""
+    cls = _REGISTRY.get(name)
+    return cls.display_name if cls is not None else name
+
+
+def get_enabled_strategies_helper() -> set[str]:
+    """Return the set of currently-enabled strategy names (default: all
+    registered). Pure convenience to avoid every caller importing both
+    `repo.get_enabled_strategies` and `list_strategies`."""
+    from polymarket_bot.persistence.repo import get_enabled_strategies
+    return get_enabled_strategies(default_all=list_strategies())

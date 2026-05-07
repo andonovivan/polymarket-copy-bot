@@ -1,20 +1,29 @@
-"""Typed accessors over the SQLite store. Used by both live and paper brokers."""
+"""Typed accessors over the PostgreSQL store. Used by both live and paper brokers.
+
+Phase B (May 2026) replaced the SQLite singleton + threading-lock pattern
+with a `psycopg_pool.ConnectionPool`. Every public function below is a
+short `with get_pool().connection() as conn:` block — the pool is
+thread-safe so the dashboard server thread and the tick-loop thread can
+hit it concurrently without external locking.
+"""
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import structlog
 
-from polymarket_bot.persistence.schema import get_conn, lock
+from polymarket_bot.persistence.schema import get_pool
 
 logger = structlog.get_logger()
 
 
 # ---------------------------------------------------------------------------
-# Domain types
+# Domain types — column order matches the SELECT order used everywhere below,
+# so `dataclass(*row)` works without keyword unpacking.
 # ---------------------------------------------------------------------------
 
 
@@ -79,6 +88,13 @@ class Settlement:
     strategy: str
 
 
+_MARKET_COLS = (
+    "market_id, slug, resolution_ts, yes_token_id, no_token_id, "
+    "outcome, bar_open, bar_close, title, "
+    "last_yes_bid, last_yes_ask, last_yes_mid, last_quote_ts"
+)
+
+
 # ---------------------------------------------------------------------------
 # Markets
 # ---------------------------------------------------------------------------
@@ -86,37 +102,35 @@ class Settlement:
 
 def upsert_market(m: Market) -> None:
     """Insert or update a market row, preserving cached quote columns when present."""
-    conn = get_conn()
-    with lock():
+    with get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO markets "
             "(market_id, slug, title, resolution_ts, yes_token_id, no_token_id, "
             " outcome, bar_open, bar_close, discovered_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(market_id) DO UPDATE SET "
-            "  slug=excluded.slug, "
-            "  title=COALESCE(excluded.title, markets.title), "
-            "  resolution_ts=excluded.resolution_ts, "
-            "  yes_token_id=excluded.yes_token_id, "
-            "  no_token_id=excluded.no_token_id, "
-            "  outcome=COALESCE(excluded.outcome, markets.outcome), "
-            "  bar_open=COALESCE(excluded.bar_open, markets.bar_open), "
-            "  bar_close=COALESCE(excluded.bar_close, markets.bar_close)",
-            (m.market_id, m.slug, m.title, m.resolution_ts, m.yes_token_id, m.no_token_id,
-             m.outcome, m.bar_open, m.bar_close, int(time.time())),
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (market_id) DO UPDATE SET "
+            "  slug = EXCLUDED.slug, "
+            "  title = COALESCE(EXCLUDED.title, markets.title), "
+            "  resolution_ts = EXCLUDED.resolution_ts, "
+            "  yes_token_id = EXCLUDED.yes_token_id, "
+            "  no_token_id = EXCLUDED.no_token_id, "
+            "  outcome = COALESCE(EXCLUDED.outcome, markets.outcome), "
+            "  bar_open = COALESCE(EXCLUDED.bar_open, markets.bar_open), "
+            "  bar_close = COALESCE(EXCLUDED.bar_close, markets.bar_close)",
+            (m.market_id, m.slug, m.title, m.resolution_ts, m.yes_token_id,
+             m.no_token_id, m.outcome, m.bar_open, m.bar_close, int(time.time())),
         )
-        conn.commit()
 
 
-def update_market_quote(market_id: str, yes_bid: float | None, yes_ask: float | None) -> None:
+def update_market_quote(market_id: str, yes_bid: float | None,
+                        yes_ask: float | None) -> None:
     """Cache the most recent YES bid/ask/mid for MTM display.
 
     Mid policy:
       - both sides present → average
-      - only one side      → that side (one-sided books still mark a position)
-      - neither side       → keep the previous mid (don't NULL it out)
-    `last_quote_ts` only advances when this poll produced *some* usable price;
-    an empty book leaves the timestamp at its last good value.
+      - only one side      → that side
+      - neither side       → keep previous mid (don't NULL it out)
+    `last_quote_ts` only advances when this poll produced *some* usable price.
     """
     if yes_bid is not None and yes_ask is not None:
         yes_mid = (yes_bid + yes_ask) / 2.0
@@ -126,76 +140,58 @@ def update_market_quote(market_id: str, yes_bid: float | None, yes_ask: float | 
         yes_mid = yes_ask
     else:
         yes_mid = None
-    conn = get_conn()
-    with lock():
+    with get_pool().connection() as conn:
         if yes_mid is None:
-            # No usable quote this poll — only refresh bid/ask snapshot, keep
-            # last_yes_mid / last_quote_ts as-is so the dashboard doesn't lie.
             conn.execute(
-                "UPDATE markets SET last_yes_bid=?, last_yes_ask=? WHERE market_id=?",
+                "UPDATE markets SET last_yes_bid=%s, last_yes_ask=%s WHERE market_id=%s",
                 (yes_bid, yes_ask, market_id),
             )
         else:
             conn.execute(
-                "UPDATE markets SET last_yes_bid=?, last_yes_ask=?, last_yes_mid=?, last_quote_ts=? "
-                "WHERE market_id=?",
+                "UPDATE markets SET last_yes_bid=%s, last_yes_ask=%s, "
+                "last_yes_mid=%s, last_quote_ts=%s WHERE market_id=%s",
                 (yes_bid, yes_ask, yes_mid, int(time.time()), market_id),
             )
-        conn.commit()
 
 
 def get_market(market_id: str) -> Market | None:
-    conn = get_conn()
-    with lock():
+    with get_pool().connection() as conn:
         row = conn.execute(
-            "SELECT market_id, slug, resolution_ts, yes_token_id, no_token_id, outcome, "
-            "bar_open, bar_close, title, last_yes_bid, last_yes_ask, last_yes_mid, last_quote_ts "
-            "FROM markets WHERE market_id=?", (market_id,),
+            f"SELECT {_MARKET_COLS} FROM markets WHERE market_id=%s",
+            (market_id,),
         ).fetchone()
     return Market(*row) if row else None
 
 
 def markets_bulk(market_ids: list[str]) -> dict[str, Market]:
-    """Single SELECT for many market_ids — replaces N+1 `get_market` loops.
-
-    Returns a dict keyed by market_id; missing ids are simply absent.
-    """
+    """Single SELECT for many market_ids — replaces N+1 `get_market` loops."""
     if not market_ids:
         return {}
-    conn = get_conn()
-    placeholders = ",".join("?" * len(market_ids))
-    with lock():
+    with get_pool().connection() as conn:
         rows = conn.execute(
-            f"SELECT market_id, slug, resolution_ts, yes_token_id, no_token_id, outcome, "
-            f"bar_open, bar_close, title, last_yes_bid, last_yes_ask, last_yes_mid, last_quote_ts "
-            f"FROM markets WHERE market_id IN ({placeholders})",
-            tuple(market_ids),
+            f"SELECT {_MARKET_COLS} FROM markets WHERE market_id = ANY(%s)",
+            (list(market_ids),),
         ).fetchall()
     return {r[0]: Market(*r) for r in rows}
 
 
-def settle_market_row(market_id: str, outcome: str, bar_open: float, bar_close: float) -> None:
-    conn = get_conn()
-    with lock():
+def settle_market_row(market_id: str, outcome: str,
+                      bar_open: float, bar_close: float) -> None:
+    with get_pool().connection() as conn:
         conn.execute(
-            "UPDATE markets SET outcome=?, bar_open=?, bar_close=? WHERE market_id=?",
+            "UPDATE markets SET outcome=%s, bar_open=%s, bar_close=%s WHERE market_id=%s",
             (outcome, bar_open, bar_close, market_id),
         )
-        conn.commit()
 
 
 def unsettled_markets_due(now_ts: int) -> list[Market]:
     """Markets whose resolution_ts has passed but outcome is still NULL,
     AND for which we have at least one fill (i.e., we hold inventory)."""
-    conn = get_conn()
-    with lock():
+    with get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT m.market_id, m.slug, m.resolution_ts, m.yes_token_id, m.no_token_id, "
-            "m.outcome, m.bar_open, m.bar_close, m.title, "
-            "m.last_yes_bid, m.last_yes_ask, m.last_yes_mid, m.last_quote_ts "
-            "FROM markets m "
-            "WHERE m.outcome IS NULL AND m.resolution_ts <= ? "
-            "AND EXISTS (SELECT 1 FROM fills f WHERE f.market_id=m.market_id)",
+            f"SELECT {_MARKET_COLS} FROM markets m "
+            "WHERE m.outcome IS NULL AND m.resolution_ts <= %s "
+            "AND EXISTS (SELECT 1 FROM fills f WHERE f.market_id = m.market_id)",
             (now_ts,),
         ).fetchall()
     return [Market(*r) for r in rows]
@@ -207,59 +203,55 @@ def unsettled_markets_due(now_ts: int) -> list[Market]:
 
 
 def insert_order(o: Order) -> None:
-    conn = get_conn()
-    with lock():
+    with get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO orders (order_id, client_order_id, market_id, token_side, side, "
             "price, size, filled, status, placed_at, ended_at, strategy) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (o.order_id, o.client_order_id, o.market_id, o.token_side, o.side,
              o.price, o.size, o.filled, o.status, o.placed_at, o.ended_at, o.strategy),
         )
-        conn.commit()
+
+
+_ORDER_COLS = (
+    "order_id, client_order_id, market_id, token_side, side, price, size, "
+    "filled, status, placed_at, ended_at, strategy"
+)
 
 
 def open_orders_by_market(market_id: str) -> list[Order]:
-    conn = get_conn()
-    with lock():
+    with get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT order_id, client_order_id, market_id, token_side, side, price, size, "
-            "filled, status, placed_at, ended_at, strategy "
-            "FROM orders WHERE market_id=? AND status='open'",
+            f"SELECT {_ORDER_COLS} FROM orders WHERE market_id=%s AND status='open'",
             (market_id,),
         ).fetchall()
     return [Order(*r) for r in rows]
 
 
 def all_open_orders() -> list[Order]:
-    conn = get_conn()
-    with lock():
+    with get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT order_id, client_order_id, market_id, token_side, side, price, size, "
-            "filled, status, placed_at, ended_at, strategy "
-            "FROM orders WHERE status='open' ORDER BY placed_at DESC"
+            f"SELECT {_ORDER_COLS} FROM orders WHERE status='open' ORDER BY placed_at DESC"
         ).fetchall()
     return [Order(*r) for r in rows]
 
 
-def update_order_filled(order_id: str, filled: float, status: str, ended_at: int | None) -> None:
-    conn = get_conn()
-    with lock():
+def update_order_filled(order_id: str, filled: float, status: str,
+                        ended_at: int | None) -> None:
+    with get_pool().connection() as conn:
         conn.execute(
-            "UPDATE orders SET filled=?, status=?, ended_at=? WHERE order_id=?",
+            "UPDATE orders SET filled=%s, status=%s, ended_at=%s WHERE order_id=%s",
             (filled, status, ended_at, order_id),
         )
-        conn.commit()
 
 
 def cancel_order_row(order_id: str) -> None:
-    conn = get_conn()
-    with lock():
+    with get_pool().connection() as conn:
         conn.execute(
-            "UPDATE orders SET status='cancelled', ended_at=? WHERE order_id=? AND status='open'",
+            "UPDATE orders SET status='cancelled', ended_at=%s "
+            "WHERE order_id=%s AND status='open'",
             (int(time.time()), order_id),
         )
-        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -267,35 +259,48 @@ def cancel_order_row(order_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+_FILL_COLS = "id, order_id, market_id, token_side, side, price, size, fill_ts, strategy"
+
+
 def insert_fill(f: Fill) -> int:
-    conn = get_conn()
-    with lock():
-        cur = conn.execute(
-            "INSERT INTO fills (order_id, market_id, token_side, side, price, size, fill_ts, strategy) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (f.order_id, f.market_id, f.token_side, f.side, f.price, f.size, f.fill_ts, f.strategy),
-        )
-        conn.commit()
-        return int(cur.lastrowid)
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "INSERT INTO fills (order_id, market_id, token_side, side, price, size, "
+            "fill_ts, strategy) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            (f.order_id, f.market_id, f.token_side, f.side, f.price, f.size,
+             f.fill_ts, f.strategy),
+        ).fetchone()
+    return int(row[0])
 
 
 def fills_for_market(market_id: str) -> list[Fill]:
-    conn = get_conn()
-    with lock():
+    with get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT id, order_id, market_id, token_side, side, price, size, fill_ts, strategy "
-            "FROM fills WHERE market_id=? ORDER BY fill_ts",
+            f"SELECT {_FILL_COLS} FROM fills WHERE market_id=%s ORDER BY fill_ts",
             (market_id,),
         ).fetchall()
     return [Fill(*r) for r in rows]
 
 
-def list_fills(limit: int = 100, offset: int = 0) -> list[Fill]:
-    conn = get_conn()
-    with lock():
+def fills_for_order(order_id: str) -> list[Fill]:
+    """All fills recorded against one CLOB order, ordered by fill_ts.
+
+    Used by `LiveBroker._estimate_new_chunk_price` to subtract previously-
+    recorded paid amount from the cumulative weighted-avg of CLOB trades.
+    """
+    with get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT id, order_id, market_id, token_side, side, price, size, fill_ts, strategy "
-            "FROM fills ORDER BY fill_ts DESC LIMIT ? OFFSET ?",
+            f"SELECT {_FILL_COLS} FROM fills WHERE order_id=%s ORDER BY fill_ts",
+            (order_id,),
+        ).fetchall()
+    return [Fill(*r) for r in rows]
+
+
+def list_fills(limit: int = 100, offset: int = 0) -> list[Fill]:
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"SELECT {_FILL_COLS} FROM fills ORDER BY fill_ts DESC LIMIT %s OFFSET %s",
             (limit, offset),
         ).fetchall()
     return [Fill(*r) for r in rows]
@@ -308,8 +313,7 @@ def list_fills(limit: int = 100, offset: int = 0) -> list[Fill]:
 
 def markets_with_unsettled_fills() -> list[str]:
     """All market_ids that have at least one fill and no Settlement row yet."""
-    conn = get_conn()
-    with lock():
+    with get_pool().connection() as conn:
         rows = conn.execute(
             "SELECT DISTINCT f.market_id FROM fills f "
             "WHERE NOT EXISTS (SELECT 1 FROM settlements s WHERE s.market_id = f.market_id) "
@@ -320,11 +324,10 @@ def markets_with_unsettled_fills() -> list[str]:
 
 def inventory_for_market(market_id: str) -> tuple[float, float, float, float]:
     """Return (yes_shares, no_shares, avg_yes_cost, avg_no_cost) for an open market."""
-    conn = get_conn()
-    with lock():
+    with get_pool().connection() as conn:
         rows = conn.execute(
             "SELECT token_side, side, SUM(size), SUM(size*price) "
-            "FROM fills WHERE market_id=? GROUP BY token_side, side",
+            "FROM fills WHERE market_id=%s GROUP BY token_side, side",
             (market_id,),
         ).fetchall()
     return _aggregate_inventory_rows(rows)
@@ -351,26 +354,23 @@ def _aggregate_inventory_rows(rows) -> tuple[float, float, float, float]:
     return yes_shares, no_shares, avg_yes, avg_no
 
 
-def inventory_snapshot(market_ids: list[str]) -> dict[str, tuple[float, float, float, float]]:
+def inventory_snapshot(
+    market_ids: list[str],
+) -> dict[str, tuple[float, float, float, float]]:
     """Bulk inventory for many markets in a single SQL pass.
 
     Returns dict {market_id → (yes_shares, no_shares, avg_yes, avg_no)}. Empty
     list → empty dict. Missing markets are absent (no zero-fill); callers
     should default with `dict.get(mid, (0, 0, 0, 0))`.
-
-    Replaces N+1 chains of `inventory_for_market` calls in the tick loop and
-    dashboard endpoints.
     """
     if not market_ids:
         return {}
-    conn = get_conn()
-    placeholders = ",".join("?" * len(market_ids))
-    with lock():
+    with get_pool().connection() as conn:
         rows = conn.execute(
-            f"SELECT market_id, token_side, side, SUM(size), SUM(size*price) "
-            f"FROM fills WHERE market_id IN ({placeholders}) "
-            f"GROUP BY market_id, token_side, side",
-            tuple(market_ids),
+            "SELECT market_id, token_side, side, SUM(size), SUM(size*price) "
+            "FROM fills WHERE market_id = ANY(%s) "
+            "GROUP BY market_id, token_side, side",
+            (list(market_ids),),
         ).fetchall()
     grouped: dict[str, list] = {}
     for r in rows:
@@ -378,47 +378,119 @@ def inventory_snapshot(market_ids: list[str]) -> dict[str, tuple[float, float, f
     return {mid: _aggregate_inventory_rows(rs) for mid, rs in grouped.items()}
 
 
+def inventory_snapshot_for(
+    strategy: str, market_ids: list[str],
+) -> dict[str, tuple[float, float, float, float]]:
+    """Per-strategy version of `inventory_snapshot` (Phase C).
+
+    With multiple strategies sharing the DB, each strategy needs to see only
+    its own positions when sizing. Filters by `fills.strategy`.
+    """
+    if not market_ids:
+        return {}
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT market_id, token_side, side, SUM(size), SUM(size*price) "
+            "FROM fills WHERE strategy=%s AND market_id = ANY(%s) "
+            "GROUP BY market_id, token_side, side",
+            (strategy, list(market_ids)),
+        ).fetchall()
+    grouped: dict[str, list] = {}
+    for r in rows:
+        grouped.setdefault(r[0], []).append(r)
+    return {mid: _aggregate_inventory_rows(rs) for mid, rs in grouped.items()}
+
+
+def total_open_exposure_for(strategy: str) -> float:
+    """Sum (yes_shares × avg_yes_cost) across the strategy's unsettled fills.
+
+    Mirrors `_total_open_exposure_usd` in main.py but scoped to one
+    strategy. Used by the per-strategy bankroll cap (Phase C.4).
+    """
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT market_id, token_side, side, SUM(size), SUM(size*price) "
+            "FROM fills f "
+            "WHERE strategy=%s AND NOT EXISTS ("
+            "  SELECT 1 FROM settlements s "
+            "  WHERE s.market_id=f.market_id AND s.strategy=f.strategy) "
+            "GROUP BY market_id, token_side, side",
+            (strategy,),
+        ).fetchall()
+    grouped: dict[str, list] = {}
+    for r in rows:
+        grouped.setdefault(r[0], []).append(r)
+    total = 0.0
+    for rs in grouped.values():
+        yes, _, avg_yes, _ = _aggregate_inventory_rows(rs)
+        total += yes * avg_yes
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Settlements
 # ---------------------------------------------------------------------------
 
 
+_SETTLEMENT_COLS = (
+    "market_id, settled_at, outcome, yes_shares, no_shares, "
+    "avg_yes_cost, avg_no_cost, payout, cost, pnl, strategy"
+)
+
+
 def insert_settlement(s: Settlement) -> None:
-    conn = get_conn()
-    with lock():
+    """Upsert a settlement row.
+
+    Phase C: the PK is the composite (market_id, strategy), so a single
+    market can have one row per strategy that took fills on it. The
+    `strategy` column is therefore omitted from the SET clause — it's
+    part of the conflict target.
+    """
+    with get_pool().connection() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO settlements "
-            "(market_id, settled_at, outcome, yes_shares, no_shares, avg_yes_cost, avg_no_cost, "
-            " payout, cost, pnl, strategy) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"INSERT INTO settlements ({_SETTLEMENT_COLS}) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (market_id, strategy) DO UPDATE SET "
+            "  settled_at = EXCLUDED.settled_at, "
+            "  outcome = EXCLUDED.outcome, "
+            "  yes_shares = EXCLUDED.yes_shares, "
+            "  no_shares = EXCLUDED.no_shares, "
+            "  avg_yes_cost = EXCLUDED.avg_yes_cost, "
+            "  avg_no_cost = EXCLUDED.avg_no_cost, "
+            "  payout = EXCLUDED.payout, "
+            "  cost = EXCLUDED.cost, "
+            "  pnl = EXCLUDED.pnl",
             (s.market_id, s.settled_at, s.outcome, s.yes_shares, s.no_shares,
              s.avg_yes_cost, s.avg_no_cost, s.payout, s.cost, s.pnl, s.strategy),
         )
-        conn.commit()
 
 
 def list_settlements(limit: int = 100, offset: int = 0) -> list[Settlement]:
-    conn = get_conn()
-    with lock():
+    with get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT market_id, settled_at, outcome, yes_shares, no_shares, "
-            "avg_yes_cost, avg_no_cost, payout, cost, pnl, strategy "
-            "FROM settlements ORDER BY settled_at DESC LIMIT ? OFFSET ?",
+            f"SELECT {_SETTLEMENT_COLS} FROM settlements "
+            "ORDER BY settled_at DESC LIMIT %s OFFSET %s",
             (limit, offset),
         ).fetchall()
     return [Settlement(*r) for r in rows]
 
 
-def settlement_stats(from_ts: int | None = None, to_ts: int | None = None) -> dict[str, Any]:
-    conn = get_conn()
+def settlement_stats(from_ts: int | None = None,
+                     to_ts: int | None = None,
+                     strategies: list[str] | set[str] | None = None) -> dict[str, Any]:
+    """Aggregate settlement stats. Optional `strategies` filters by
+    `settlements.strategy` (Phase A.4 — the dashboard's chip filter)."""
     sql = ("SELECT COUNT(*), COALESCE(SUM(pnl),0), "
            "SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) FROM settlements WHERE 1=1")
     args: list[Any] = []
     if from_ts is not None:
-        sql += " AND settled_at>=?"; args.append(from_ts)
+        sql += " AND settled_at>=%s"; args.append(from_ts)
     if to_ts is not None:
-        sql += " AND settled_at<?"; args.append(to_ts)
-    with lock():
+        sql += " AND settled_at<%s"; args.append(to_ts)
+    if strategies:
+        sql += " AND strategy = ANY(%s)"
+        args.append(list(strategies))
+    with get_pool().connection() as conn:
         n, pnl, wins = conn.execute(sql, args).fetchone()
     return {
         "settlements": int(n or 0),
@@ -428,23 +500,30 @@ def settlement_stats(from_ts: int | None = None, to_ts: int | None = None) -> di
     }
 
 
-def daily_pnl_summary(days: int = 30) -> list[dict[str, Any]]:
+def daily_pnl_summary(days: int = 30,
+                      strategies: list[str] | set[str] | None = None) -> list[dict[str, Any]]:
     """Per-day rollup of settlements over the last `days` days.
 
     Used by the dashboard's Daily PnL bar chart and the Win-rate sparkline.
     Days with zero settlements simply don't appear in the result.
+
+    Optional `strategies` filters by `settlements.strategy` (Phase A.4 —
+    the dashboard's chip filter).
     """
-    conn = get_conn()
     floor_ts = int(time.time()) - days * 86400
-    with lock():
-        rows = conn.execute(
-            "SELECT date(settled_at, 'unixepoch') AS day, "
-            "       COUNT(*), COALESCE(SUM(pnl), 0), "
-            "       SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) "
-            "FROM settlements WHERE settled_at >= ? "
-            "GROUP BY day ORDER BY day",
-            (floor_ts,),
-        ).fetchall()
+    sql = (
+        "SELECT to_char(to_timestamp(settled_at), 'YYYY-MM-DD') AS day, "
+        "       COUNT(*), COALESCE(SUM(pnl), 0), "
+        "       SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) "
+        "FROM settlements WHERE settled_at >= %s "
+    )
+    args: list[Any] = [floor_ts]
+    if strategies:
+        sql += "AND strategy = ANY(%s) "
+        args.append(list(strategies))
+    sql += "GROUP BY day ORDER BY day"
+    with get_pool().connection() as conn:
+        rows = conn.execute(sql, args).fetchall()
     return [
         {"date": r[0], "n_settlements": int(r[1] or 0),
          "pnl": float(r[2] or 0.0), "n_wins": int(r[3] or 0)}
@@ -453,20 +532,13 @@ def daily_pnl_summary(days: int = 30) -> list[dict[str, Any]]:
 
 
 def strategy_pnl_summary(days: int = 30) -> list[dict[str, Any]]:
-    """Per-strategy rollup of settlements over the last `days` days.
-
-    Used by the dashboard's PnL-by-strategy chart. Note that today every
-    settlement row attributes to the *primary* strategy (`strategies[0]` in
-    `_tick`), so this rollup will reflect that until per-fill PnL
-    decomposition lands. See CLAUDE.md "Out of scope" for details.
-    """
-    conn = get_conn()
+    """Per-strategy rollup of settlements over the last `days` days."""
     floor_ts = int(time.time()) - days * 86400
-    with lock():
+    with get_pool().connection() as conn:
         rows = conn.execute(
             "SELECT strategy, COUNT(*), COALESCE(SUM(pnl), 0), "
             "       SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) "
-            "FROM settlements WHERE settled_at >= ? "
+            "FROM settlements WHERE settled_at >= %s "
             "GROUP BY strategy ORDER BY SUM(pnl) DESC",
             (floor_ts,),
         ).fetchall()
@@ -483,30 +555,33 @@ def strategy_pnl_summary(days: int = 30) -> list[dict[str, Any]]:
 
 
 def append_equity(ts: int, equity: float) -> None:
-    conn = get_conn()
-    with lock():
-        conn.execute("INSERT OR REPLACE INTO equity_curve (ts, equity) VALUES (?, ?)", (ts, equity))
-        conn.commit()
+    with get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO equity_curve (ts, equity) VALUES (%s, %s) "
+            "ON CONFLICT (ts) DO UPDATE SET equity = EXCLUDED.equity",
+            (ts, equity),
+        )
 
 
-def equity_curve(from_ts: int | None = None, to_ts: int | None = None) -> list[tuple[int, float]]:
-    conn = get_conn()
+def equity_curve(from_ts: int | None = None,
+                 to_ts: int | None = None) -> list[tuple[int, float]]:
     sql = "SELECT ts, equity FROM equity_curve WHERE 1=1"
     args: list[Any] = []
     if from_ts is not None:
-        sql += " AND ts>=?"; args.append(from_ts)
+        sql += " AND ts>=%s"; args.append(from_ts)
     if to_ts is not None:
-        sql += " AND ts<?"; args.append(to_ts)
+        sql += " AND ts<%s"; args.append(to_ts)
     sql += " ORDER BY ts"
-    with lock():
+    with get_pool().connection() as conn:
         rows = conn.execute(sql, args).fetchall()
     return [(int(r[0]), float(r[1])) for r in rows]
 
 
 def latest_equity() -> float | None:
-    conn = get_conn()
-    with lock():
-        row = conn.execute("SELECT equity FROM equity_curve ORDER BY ts DESC LIMIT 1").fetchone()
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT equity FROM equity_curve ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
     return float(row[0]) if row else None
 
 
@@ -516,14 +591,91 @@ def latest_equity() -> float | None:
 
 
 def get_meta(key: str) -> str | None:
-    conn = get_conn()
-    with lock():
-        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    with get_pool().connection() as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key=%s", (key,)).fetchone()
     return row[0] if row else None
 
 
 def set_meta(key: str, value: str) -> None:
-    conn = get_conn()
-    with lock():
-        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
-        conn.commit()
+    with get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            (key, value),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Per-strategy enabled flags (Phase A.3) — persisted in the meta table.
+# Stored as a JSON list under `meta['enabled_strategies']`. When the row is
+# absent (fresh DB), all strategies are considered enabled — callers wanting
+# the "real" set should pass `default_all` from the registry.
+# ---------------------------------------------------------------------------
+
+_ENABLED_KEY = "enabled_strategies"
+
+
+def get_enabled_strategies(default_all: list[str] | None = None) -> set[str]:
+    raw = get_meta(_ENABLED_KEY)
+    if raw is None:
+        return set(default_all or [])
+    try:
+        names = json.loads(raw)
+        if isinstance(names, list):
+            return {str(n) for n in names}
+    except (ValueError, TypeError):
+        pass
+    return set(default_all or [])
+
+
+def set_enabled_strategies(names: set[str] | list[str]) -> None:
+    set_meta(_ENABLED_KEY, json.dumps(sorted(set(names))))
+
+
+# ---------------------------------------------------------------------------
+# Forecast cache (Phase C.5) — shared across strategy services so each one
+# doesn't independently hit Open-Meteo for the same (city, target_date).
+#
+# `members` is stored as a JSONB array of integer day-max temps. TTL-style
+# eviction lives in the read path (`forecast_cache_get` returns None if the
+# row is older than `max_age_seconds`); writes ALWAYS upsert.
+# ---------------------------------------------------------------------------
+
+
+def forecast_cache_get(city_key: str, target_date: str,
+                       max_age_seconds: int) -> list[int] | None:
+    """Return cached members iff the row is fresh, else None.
+
+    The freshness check happens here (not on the writer) so any service
+    can decide what TTL to honour. `weather_feed.CACHE_TTL_SECONDS` is the
+    canonical default but tests / preflight may want a tighter window.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT fetched_at, members FROM forecast_cache "
+            "WHERE city_key=%s AND target_date=%s",
+            (city_key, target_date),
+        ).fetchone()
+    if row is None:
+        return None
+    fetched_at, members = row
+    if int(time.time()) - int(fetched_at) > max_age_seconds:
+        return None
+    if not isinstance(members, list):
+        return None
+    return [int(m) for m in members]
+
+
+def forecast_cache_put(city_key: str, target_date: str,
+                       members: list[int]) -> None:
+    """Upsert the (city, date) → members row. Caller picks `fetched_at`."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO forecast_cache (city_key, target_date, fetched_at, members) "
+            "VALUES (%s, %s, %s, %s::jsonb) "
+            "ON CONFLICT (city_key, target_date) DO UPDATE SET "
+            "  fetched_at = EXCLUDED.fetched_at, "
+            "  members = EXCLUDED.members",
+            (city_key, target_date, int(time.time()),
+             json.dumps([int(m) for m in members])),
+        )

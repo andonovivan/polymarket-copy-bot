@@ -11,8 +11,8 @@ from polymarket_bot.execution.error_codes import classify
 from polymarket_bot.persistence.repo import (
     Fill,
     Order,
-    append_equity,
     cancel_order_row,
+    fills_for_order,
     insert_fill,
     insert_order,
     open_orders_by_market,
@@ -68,21 +68,81 @@ def _handle_clob_failure(context: str, http_status: int | None, message: str | N
     return err.action
 
 
+_RETRY_MAX = 3
+_RETRY_BASE_SLEEP = 1.0
+
+
 class LiveBroker(Broker):
     def __init__(self, client: PolymarketClient) -> None:
         self.client = client
+
+    def _place_with_retry(self, action: PlaceLimit) -> dict | None:
+        """Call `client.place_order` with bounded retry on RETRY-class errors.
+
+        Behavior:
+          * HALT → bail immediately (also flips the global halt flag).
+          * RETRY → sleep `base * 2^attempt` and try again, up to RETRY_MAX.
+          * SKIP / explicit success-false → bubble back as `result` so the
+            caller can record/log it.
+          * Transport exceptions (None response, raised exceptions in the
+            client wrapper) → treated like RETRY.
+
+        Returns the final dict response (which may have success=False) or
+        None if every attempt failed.
+        """
+        delay = _RETRY_BASE_SLEEP
+        last_msg = "no response"
+        for attempt in range(_RETRY_MAX):
+            try:
+                result = self.client.place_order(
+                    token_id=action.token_id, side=action.side,
+                    price=action.price, size=action.size,
+                )
+            except Exception as exc:
+                action_class = _handle_clob_failure(
+                    "place_order", None, str(exc)[:200])
+                if action_class == "HALT":
+                    return None
+                last_msg = str(exc)[:200]
+                time.sleep(delay)
+                delay *= 2
+                continue
+            if result is None:
+                # No response from the wrapper — treat as a transport blip.
+                _handle_clob_failure("place_order", None, "no response")
+                last_msg = "no response"
+                time.sleep(delay)
+                delay *= 2
+                continue
+            if result.get("success"):
+                return result
+            # Server returned an explicit rejection — let `place_limit`
+            # classify and decide whether to retry. We only retry RETRY-class
+            # errors here; SKIP / HALT are returned for the caller to handle.
+            from polymarket_bot.execution.error_codes import classify
+            err = classify(400, result.get("errorMsg") or result.get("error"))
+            if err.action == "RETRY":
+                logger.warning("place_retry", attempt=attempt + 1,
+                               message=err.message[:160])
+                time.sleep(delay)
+                delay *= 2
+                continue
+            # SKIP / HALT / unknown → return so the caller logs and moves on.
+            return result
+        logger.warning("place_gave_up", retries=_RETRY_MAX, last=last_msg[:160])
+        return None
 
     def place_limit(self, action: PlaceLimit, strategy: str) -> Order | None:
         if _HALTED:
             logger.warning("place_skipped_halted", market_id=action.market_id[:12])
             return None
 
-        result = self.client.place_order(
-            token_id=action.token_id, side=action.side,
-            price=action.price, size=action.size,
-        )
+        # Phase D.2 — retry on transient errors (rate limits, matching-engine
+        # restarts, transport blips) with exponential backoff. HALT errors
+        # short-circuit immediately; SKIP errors propagate as a single
+        # rejection (don't keep retrying a bad-payload order).
+        result = self._place_with_retry(action)
         if result is None:
-            _handle_clob_failure("place_order", None, "no response")
             return None
 
         # Per docs: { "success": bool, "orderID": str, "status": "live"|"matched"|"delayed",
@@ -144,6 +204,12 @@ class LiveBroker(Broker):
         Per docs, get_order returns size_matched/original_size in 6-decimal
         fixed-math (string). Convert via DECIMALS before comparing to o.size,
         which is in real shares.
+
+        Phase D.1: the new fill chunk's price is computed as the weighted
+        average of *only the trades since the last reconcile* (delta of the
+        cumulative weighted-avg). For taker orders against a static book
+        this matches the limit price; for maker orders that filled at
+        improved prices it captures the actual average correctly.
         """
         n = 0
         for b in event.buckets:
@@ -159,9 +225,7 @@ class LiveBroker(Broker):
                 if filled_real <= o.filled:
                     continue
                 new_size = filled_real - o.filled
-                # CLOB get_order doesn't return a fill price; for a maker order at
-                # our limit, fill price ≈ limit. The exact average is in get_trades.
-                fill_price = float(status.get("price", o.price))
+                fill_price = self._estimate_new_chunk_price(o, new_size)
                 insert_fill(Fill(
                     id=None, order_id=o.order_id, market_id=o.market_id,
                     token_side=o.token_side, side=o.side,
@@ -178,24 +242,97 @@ class LiveBroker(Broker):
                 logger.info("live_order_fill",
                             order_id=o.order_id[:18], market=b.label,
                             new_shares=round(new_size, 4),
+                            new_price=round(fill_price, 4),
                             total_filled=round(filled_real, 4),
                             done=done)
         return n
 
+    def _estimate_new_chunk_price(self, o: Order, new_size: float) -> float:
+        """Weighted-avg fill price for the chunk of `new_size` shares that
+        filled since the last reconcile.
 
-def sync_wallet_balance(client: PolymarketClient) -> float | None:
-    """Read the wallet's free USDC (Polymarket collateral) and append to equity_curve.
+        Strategy:
+          1. Fetch all trades for `o.order_id`.
+          2. Sum (size, size·price) across them.
+          3. Subtract what we've already recorded (existing fills for this
+             order) to isolate the new chunk's weighted total.
+          4. Divide → price for the new chunk.
 
-    NOTE: this is *cash only* — does not include the value of held YES tokens.
-    For total live equity you also need the position value (see
-    `compute_live_equity` in main.py).
+        Falls back to `o.price` if trades aren't available — this is the
+        correct approximation for taker fills against a static book, which
+        is the bot's predominant order shape (BUY at yes_ask, SELL at
+        yes_bid).
+        """
+        trades = self.client.get_trades_for_order(o.order_id)
+        if not trades:
+            return float(o.price)
 
-    Call once on startup and periodically (e.g. every 5 min) in live mode.
+        cum_size = 0.0
+        cum_paid = 0.0
+        for t in trades:
+            sz = _fm6(t.get("size", 0))
+            try:
+                pr = float(t.get("price", 0) or 0)
+            except (TypeError, ValueError):
+                pr = 0.0
+            if sz > 0 and 0.0 <= pr <= 1.0:
+                cum_size += sz
+                cum_paid += sz * pr
+        if cum_size <= 0:
+            return float(o.price)
+
+        prev_size = 0.0
+        prev_paid = 0.0
+        for f in fills_for_order(o.order_id):
+            prev_size += float(f.size)
+            prev_paid += float(f.size) * float(f.price)
+
+        chunk_size = cum_size - prev_size
+        chunk_paid = cum_paid - prev_paid
+        if chunk_size <= 0:
+            return float(o.price)
+        chunk_price = chunk_paid / chunk_size
+        # Sanity-clamp: prices outside [0.001, 0.999] would be a bug or a
+        # stale-trade artefact; falling back to limit is safer than logging
+        # a corrupt fill row.
+        if not (0.001 <= chunk_price <= 0.999):
+            return float(o.price)
+        return chunk_price
+
+
+EQUITY_DRIFT_WARN_THRESHOLD = 1.0
+
+
+def sync_wallet_balance(client: PolymarketClient,
+                        starting_bankroll: float = 100.0) -> float | None:
+    """Read the wallet's free USDC and reconcile it with our derived equity.
+
+    Phase D.3: previously this wrote cash-only into the equity curve while
+    `_maybe_sample_equity` (in main.py) wrote MTM-aware equity from the
+    same curve — two writers, divergent curve. Now we *don't* append a
+    cash-only point; instead we compare wallet cash against our derived
+    realized cash and warn when they drift more than
+    `EQUITY_DRIFT_WARN_THRESHOLD`. The MTM-aware sampler stays the single
+    writer of `equity_curve`.
+
+    Returns the wallet cash for caller logging.
     """
+    from polymarket_bot.main import _realized_cash   # avoid import cycle
     balance = client.get_balance_usdc()
     if balance is None:
         logger.warning("wallet_balance_fetch_failed")
         return None
-    append_equity(int(time.time()), float(balance))
-    logger.info("wallet_balance_synced", usdc=round(float(balance), 4))
-    return float(balance)
+    cash_real = float(balance)
+    cash_derived = _realized_cash(starting_bankroll)
+    drift = cash_real - cash_derived
+    if abs(drift) > EQUITY_DRIFT_WARN_THRESHOLD:
+        logger.warning("equity_drift",
+                       wallet_cash=round(cash_real, 4),
+                       derived_cash=round(cash_derived, 4),
+                       drift=round(drift, 4),
+                       hint="check for missing fills or settlements")
+    else:
+        logger.info("wallet_balance_synced",
+                    wallet_cash=round(cash_real, 4),
+                    derived_cash=round(cash_derived, 4))
+    return cash_real

@@ -49,6 +49,44 @@ class PolymarketClient:
             logger.warning("balance_fetch_failed")
             return None
 
+    def get_usdc_allowance(self) -> float | None:
+        """Read the wallet's CLOB-spending USDC allowance (Phase D.4).
+
+        Returns 0.0 if the wallet has never approved the exchange contract,
+        or None on RPC failure. The bot needs this > expected position
+        notional, otherwise BUY orders will be rejected with a balance
+        error at submission time.
+        """
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            resp = self.clob.get_balance_allowance(params)
+            return float(resp.get("allowance", 0)) if resp else None
+        except Exception as exc:
+            logger.warning("allowance_fetch_failed", error=str(exc)[:160])
+            return None
+
+    def get_trades_for_order(self, order_id: str) -> list[dict] | None:
+        """Fetch trade-level fills for one order (Phase D.1).
+
+        Used by `LiveBroker.reconcile_fills` to compute the *real* weighted-
+        average fill price instead of falling back to the order's limit
+        price. The CLOB API doesn't filter trades by order_id at the
+        server, so we fetch with a coarse filter (maker addr / market) and
+        match the order_id client-side. Returns an empty list if the order
+        has no trades yet, or None on transport failure.
+        """
+        try:
+            from py_clob_client.clob_types import TradeParams
+            params = TradeParams()
+            trades = self.clob.get_trades(params)
+            if not trades:
+                return []
+            return [t for t in trades if str(t.get("order_id") or "") == order_id]
+        except Exception as exc:
+            logger.warning("get_trades_failed",
+                           order_id=order_id[:18], error=str(exc)[:160])
+            return None
+
     # ------------------------------------------------------------------
     # Market reads
     # ------------------------------------------------------------------

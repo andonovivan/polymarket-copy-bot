@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 import pytest
 
-import polymarket_bot.persistence.schema as schema
 from polymarket_bot.persistence.repo import (
     Fill,
     Market,
@@ -25,12 +23,8 @@ from polymarket_bot.persistence.repo import (
 )
 
 
-@pytest.fixture
-def fresh_db(tmp_path):
-    schema._conn = None
-    schema.init_db(tmp_path / "test.db")
-    yield
-    schema._conn = None
+# DB lifecycle (Postgres testcontainer + per-test TRUNCATE) is handled in
+# tests/conftest.py — these tests just need the autouse fixture to fire.
 
 
 def _seed_market(mid: str, title: str = "Paris · May 5 · 14°C") -> None:
@@ -75,7 +69,7 @@ def _seed_settlement(mid: str, *, pnl: float, settled_at: int,
 # markets_bulk
 # ---------------------------------------------------------------------------
 
-def test_markets_bulk_returns_dict_keyed_by_market_id(fresh_db):
+def test_markets_bulk_returns_dict_keyed_by_market_id():
     _seed_market("m1", "Paris · May 5 · 14°C")
     _seed_market("m2", "Madrid · May 5 · 18°C")
     out = markets_bulk(["m1", "m2"])
@@ -84,14 +78,14 @@ def test_markets_bulk_returns_dict_keyed_by_market_id(fresh_db):
     assert out["m2"].title == "Madrid · May 5 · 18°C"
 
 
-def test_markets_bulk_handles_missing_ids(fresh_db):
+def test_markets_bulk_handles_missing_ids():
     _seed_market("m1")
     out = markets_bulk(["m1", "m-nope"])
     assert "m1" in out
     assert "m-nope" not in out
 
 
-def test_markets_bulk_empty_input_returns_empty_dict(fresh_db):
+def test_markets_bulk_empty_input_returns_empty_dict():
     assert markets_bulk([]) == {}
 
 
@@ -99,7 +93,7 @@ def test_markets_bulk_empty_input_returns_empty_dict(fresh_db):
 # inventory_snapshot
 # ---------------------------------------------------------------------------
 
-def test_inventory_snapshot_matches_per_market_helper(fresh_db):
+def test_inventory_snapshot_matches_per_market_helper():
     _seed_market("m1")
     _seed_market("m2")
     _seed_fill("m1", token="YES", side="BUY", size=10, price=0.30)
@@ -111,11 +105,11 @@ def test_inventory_snapshot_matches_per_market_helper(fresh_db):
     assert snap["m2"] == inventory_for_market("m2")
 
 
-def test_inventory_snapshot_empty_input(fresh_db):
+def test_inventory_snapshot_empty_input():
     assert inventory_snapshot([]) == {}
 
 
-def test_inventory_snapshot_omits_markets_with_no_fills(fresh_db):
+def test_inventory_snapshot_omits_markets_with_no_fills():
     _seed_market("m1")
     _seed_market("m2")
     _seed_fill("m1", token="YES", side="BUY", size=10, price=0.30)
@@ -129,7 +123,7 @@ def test_inventory_snapshot_omits_markets_with_no_fills(fresh_db):
 # daily_pnl_summary
 # ---------------------------------------------------------------------------
 
-def test_daily_pnl_groups_settlements_by_day(fresh_db):
+def test_daily_pnl_groups_settlements_by_day():
     _seed_market("m1"); _seed_market("m2"); _seed_market("m3")
     now = int(time.time())
     day = 86400
@@ -154,7 +148,7 @@ def test_daily_pnl_groups_settlements_by_day(fresh_db):
     assert yesterday_row["pnl"] == pytest.approx(-3.0)
 
 
-def test_daily_pnl_respects_lookback_window(fresh_db):
+def test_daily_pnl_respects_lookback_window():
     _seed_market("m1"); _seed_market("m2")
     now = int(time.time())
     _seed_settlement("m1", pnl=10.0, settled_at=now - 5 * 86400)
@@ -168,7 +162,7 @@ def test_daily_pnl_respects_lookback_window(fresh_db):
 # strategy_pnl_summary
 # ---------------------------------------------------------------------------
 
-def test_strategy_pnl_groups_by_strategy(fresh_db):
+def test_strategy_pnl_groups_by_strategy():
     _seed_market("m1"); _seed_market("m2"); _seed_market("m3")
     now = int(time.time())
     _seed_settlement("m1", pnl=10.0, settled_at=now - 100, strategy="weather_forecast")
@@ -184,7 +178,50 @@ def test_strategy_pnl_groups_by_strategy(fresh_db):
     assert by_name["bucket_arbitrage"]["pnl"] == pytest.approx(2.0)
 
 
-def test_strategy_pnl_orders_descending_by_pnl(fresh_db):
+# ---------------------------------------------------------------------------
+# Phase A.4 — server-side strategy filter on the dashboard aggregates.
+# ---------------------------------------------------------------------------
+
+def test_daily_pnl_summary_filters_by_strategy():
+    """Passing `strategies=[…]` must scope the rollup to those strategies."""
+    from polymarket_bot.persistence.repo import daily_pnl_summary
+    _seed_market("m1"); _seed_market("m2"); _seed_market("m3")
+    now = int(time.time())
+    _seed_settlement("m1", pnl=10.0, settled_at=now - 60, strategy="weather_forecast")
+    _seed_settlement("m2", pnl=-5.0, settled_at=now - 60, strategy="weather_forecast")
+    _seed_settlement("m3", pnl=20.0, settled_at=now - 60, strategy="bucket_arbitrage")
+
+    weather_only = daily_pnl_summary(days=7, strategies=["weather_forecast"])
+    assert len(weather_only) == 1
+    assert weather_only[0]["pnl"] == pytest.approx(5.0)
+    assert weather_only[0]["n_settlements"] == 2
+
+    arb_only = daily_pnl_summary(days=7, strategies=["bucket_arbitrage"])
+    assert len(arb_only) == 1
+    assert arb_only[0]["pnl"] == pytest.approx(20.0)
+
+
+def test_settlement_stats_filters_by_strategy():
+    """settlement_stats(strategies=[…]) — used by the dashboard's
+    today-card so per-strategy filter shows accurate counts."""
+    from polymarket_bot.persistence.repo import settlement_stats
+    _seed_market("m1"); _seed_market("m2"); _seed_market("m3")
+    now = int(time.time())
+    _seed_settlement("m1", pnl=10.0, settled_at=now - 60, strategy="weather_forecast")
+    _seed_settlement("m2", pnl=-5.0, settled_at=now - 60, strategy="weather_forecast")
+    _seed_settlement("m3", pnl=20.0, settled_at=now - 60, strategy="bucket_arbitrage")
+
+    s = settlement_stats(strategies=["weather_forecast"])
+    assert s["settlements"] == 2
+    assert s["pnl"] == pytest.approx(5.0)
+    assert s["wins"] == 1
+
+    s_all = settlement_stats()
+    assert s_all["settlements"] == 3
+    assert s_all["pnl"] == pytest.approx(25.0)
+
+
+def test_strategy_pnl_orders_descending_by_pnl():
     _seed_market("m1"); _seed_market("m2")
     now = int(time.time())
     _seed_settlement("m1", pnl=-3.0, settled_at=now - 100, strategy="loser")

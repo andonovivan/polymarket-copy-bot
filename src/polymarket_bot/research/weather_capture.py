@@ -33,7 +33,7 @@ from polymarket_bot.backtest.weather_city_eval import CANDIDATES, geocode
 from polymarket_bot.data.weather_feed import (
     CITY_REGISTRY, City, bucket_probabilities, get_ensemble,
 )
-from polymarket_bot.persistence.schema import get_conn, lock
+from polymarket_bot.persistence.schema import get_pool
 from polymarket_bot.polymarket.weather_markets import (
     discover_event, gamma_outcome, populate_quotes,
 )
@@ -92,11 +92,10 @@ def _capture_registry(include_candidates: bool = False) -> dict[str, City]:
 def _recent_obs_exists(city_key: str, slug: str, bucket_label: str,
                        within_seconds: int) -> bool:
     cutoff = int(time.time()) - within_seconds
-    conn = get_conn()
-    with lock():
+    with get_pool().connection() as conn:
         row = conn.execute(
             "SELECT 1 FROM weather_research_obs "
-            "WHERE city_key=? AND slug=? AND bucket_label=? AND observed_at >= ? "
+            "WHERE city_key=%s AND slug=%s AND bucket_label=%s AND observed_at >= %s "
             "LIMIT 1",
             (city_key, slug, bucket_label, cutoff),
         ).fetchone()
@@ -107,18 +106,16 @@ def _record_obs(city_key: str, target_date: str, slug: str, bucket_label: str,
                 model_p: float, model_day_max_mean: float | None,
                 mid: float | None, bid: float | None,
                 ask: float | None) -> None:
-    conn = get_conn()
-    with lock():
+    with get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO weather_research_obs "
             "(city_key, target_date, slug, bucket_label, model_p, "
             " model_day_max_mean, market_yes_mid, market_yes_bid, "
             " market_yes_ask, observed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (city_key, target_date, slug, bucket_label, model_p,
              model_day_max_mean, mid, bid, ask, int(time.time())),
         )
-        conn.commit()
 
 
 # Polymarket weather events resolve around noon UTC on their target date
@@ -213,14 +210,13 @@ def update_outcomes() -> int:
 
     Returns the number of rows updated.
     """
-    conn = get_conn()
     now_utc = datetime.now(timezone.utc)
     today = now_utc.strftime("%Y-%m-%d")
     floor = (now_utc - timedelta(days=UNRESOLVED_GIVE_UP_DAYS)).strftime("%Y-%m-%d")
-    with lock():
+    with get_pool().connection() as conn:
         rows = conn.execute(
             "SELECT DISTINCT city_key, slug FROM weather_research_obs "
-            "WHERE outcome IS NULL AND target_date < ? AND target_date >= ?",
+            "WHERE outcome IS NULL AND target_date < %s AND target_date >= %s",
             (today, floor),
         ).fetchall()
     if not rows:
@@ -236,17 +232,16 @@ def update_outcomes() -> int:
             outcomes = gamma_outcome(ev, client=c)
             if outcomes is None:
                 continue
-            with lock():
+            with get_pool().connection() as conn:
                 for label, yes in outcomes.items():
                     won = 1 if yes == 1.0 else 0
                     cur = conn.execute(
                         "UPDATE weather_research_obs "
-                        "SET outcome=?, settled_at=? "
-                        "WHERE slug=? AND bucket_label=? AND outcome IS NULL",
+                        "SET outcome=%s, settled_at=%s "
+                        "WHERE slug=%s AND bucket_label=%s AND outcome IS NULL",
                         (won, now, slug, label),
                     )
                     n_updated += cur.rowcount
-                conn.commit()
     if n_updated:
         logger.info("research_outcomes_updated", rows=n_updated)
     return n_updated

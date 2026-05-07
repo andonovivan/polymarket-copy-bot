@@ -25,9 +25,14 @@ happens automatically when the gamma API reports the event resolved.
   [`PaperBroker`](src/polymarket_bot/execution/paper_broker.py). Safe.
 - **live** — places real orders. Requires both `--live` flag *and*
   `POLYMARKET_BOT_LIVE=1` *and* a `PRIVATE_KEY`. Two-key safety to make
-  accidental live trading hard.
+  accidental live trading hard. Always run [`preflight`](#first-live-runbook)
+  before flipping the switch.
 - **backtest-weather** — read-only research subcommand; ranks candidate cities
   by historical model-vs-market edge. See [Path A](#backtest-harness-path-a).
+- **preflight** — `polymarket-bot preflight` runs the live-mode safety
+  checks (config, gamma reachability, USDC balance + allowance, risk caps).
+  Exits non-zero on any failure. Run before the first live session and
+  after wallet/key/allowance changes.
 
 ## Tick data flow
 
@@ -297,25 +302,42 @@ the env file). Vanilla JS SPA over a small JSON API.
 - `GET /api/stats/today` — settlements / wins / pnl / latest_equity
 - `GET /api/fills?limit=N&offset=M` — `{fills, offset, has_more}`
 - `GET /api/settlements?limit=N&offset=M` — `{settlements, offset, has_more}`
-- `GET /api/strategies` — registered strategies + which is enabled
+- `GET /api/strategies` — registered strategies, each with `name`,
+  `display_name`, and the **persisted-meta-backed** `enabled` flag
+- `POST /api/strategies/enabled` — body `{names: [...]}` writes the
+  enabled set into `meta['enabled_strategies']`. The Router checks this
+  on every `execute()` and **drops only BUY** actions for disabled
+  strategies — SELLs (profit-takes) and CancelOrders pass through so
+  existing positions can wind down.
 - `GET /api/settings` — current config (secrets masked)
 - `GET /api/logs` — placeholder; returns `{lines: []}`
+
+`/api/dashboard` accepts an optional `?strategies=A,B` query — when
+provided, `strategy_pnl` is filtered server-side. The frontend
+persists the selection in `localStorage['dashboard.strategy_filter']`
+and rebuilds the chip group on every dashboard tick.
 
 The `has_more` field on paginated endpoints is computed server-side via the
 cheap `LIMIT N+1` trick — no `COUNT(*)` query.
 
 **Dashboard charts and visualisations:**
 
+- **Strategy filter chips** — at the top of the page, one per registered
+  strategy. Click to include/exclude from `strategy_pnl`. Selection
+  persists in `localStorage`.
 - **Equity curve** — uPlot line, full width.
 - **Daily P&L** (last 30 days) — uPlot bars, half width. Green/red by sign.
 - **Win-rate trend** (last 30 days) — uPlot sparkline, half width, y in [0,1].
-- **Inventory by city** — HTML/CSS horizontal bars, half width. Aggregates
-  current open positions by city extracted from the bucket title.
-- **P&L by strategy** — same HTML/CSS bar pattern, half width. Surfaces
-  the multi-strategy attribution from `settlements.strategy`.
+- **P&L by strategy** — HTML/CSS horizontal bars, full width. Uses
+  `display_name` on each row, sourced from the registry.
 
-The two new uPlot instances reuse a shared `_makeChart(container, data, opts)`
-factory; the two HTML bar lists share `_renderBarList(container, rows, opts)`.
+The two uPlot instances share `_makeChart(container, data, opts)`; the bar
+list reuses `_renderBarList(container, rows, opts)`.
+
+**Strategies page** displays each strategy with its `display_name`, registry
+key (subdued monospace), and a checkbox bound to
+`POST /api/strategies/enabled`. Toggling propagates to the dashboard's
+chip filter so disabled strategies disappear from stats automatically.
 
 **Frontend** ([`app.js`](src/polymarket_bot/dashboard/static/app.js)):
 
@@ -348,21 +370,139 @@ factory; the two HTML bar lists share `_renderBarList(container, rows, opts)`.
 
 ## Persistence
 
-SQLite, single file at `BOT_DB_PATH` (Docker default
-`/app/state/bot_state.db`, mounted on the `bot_state` named volume).
+**PostgreSQL** (Phase B, May 2026). Connection-pooled via
+[`psycopg_pool.ConnectionPool`](src/polymarket_bot/persistence/schema.py)
+in `_pool`, configured from `DATABASE_URL` (docker-compose default points
+at the bundled `postgres` service).
 
 Tables ([schema.py](src/polymarket_bot/persistence/schema.py)):
-`markets`, `orders`, `fills`, `settlements`, `equity_curve`, `meta`,
-`weather_research_obs`. WAL journaling, foreign keys on, busy_timeout 5s.
+`markets`, `orders`, `fills` (BIGSERIAL id), `settlements`, `equity_curve`,
+`meta`, `weather_research_obs`. Foreign keys enforced. Indexes include a
+**partial index** `idx_research_obs_unsettled ON weather_research_obs
+(target_date) WHERE outcome IS NULL` for the hot path that backfills
+outcomes after settlement.
 
-Schema migrations are forward-only (`CREATE TABLE IF NOT EXISTS` plus
-explicit `ALTER TABLE ADD COLUMN` for known new columns). Legacy
-direction-prediction tables from a previous iteration are dropped on first
-boot.
+Connection model:
+- Every repo function does
+  `with get_pool().connection() as conn: conn.execute(...)`.
+- The pool is thread-safe — the dashboard server thread and the tick
+  loop hit it concurrently without external locking. (The legacy
+  `lock()` helper from the SQLite era is gone.)
+- DDL is idempotent (`CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT
+  EXISTS`); `init_db()` is safe to call multiple times.
+
+Tests use [`testcontainers[postgres]`](tests/conftest.py) — a
+`postgres:16-alpine` container is started once per session and tables
+are `TRUNCATE … RESTART IDENTITY CASCADE`'d between tests.
 
 Inventory and PnL are **derived from `fills` and `settlements`** at query
 time — there is no live position table to keep in sync. This makes the
-schema simpler at the cost of slightly more SQL per tick.
+schema simpler at the cost of slightly more SQL per tick (mitigated by
+`inventory_snapshot` and `markets_bulk` doing one round-trip per tick).
+
+**Switching from the SQLite era** (paper data is disposable):
+```bash
+docker compose down -v   # destroy old SQLite volume
+docker compose up -d --build   # fresh Postgres + new pool
+```
+
+## Architecture (Phase C — microservices)
+
+The bot ships as **five long-running containers** sharing one Postgres
+instance. Each strategy lives in its own process; a single
+orders-watcher reconciles all CLOB fills + settles resolved events; the
+dashboard is HTTP-only.
+
+```
+postgres                                — DB + healthcheck
+strategy-weather       (strategy_runner) — runs WeatherForecastStrategy only
+strategy-bucket-arb    (strategy_runner) — runs BucketArbitrageStrategy only
+orders-watcher         (orders_watcher)  — owns CLOB fill polling + settlement
+dashboard              (dashboard)       — HTTP server only, read-only on the DB
+```
+
+**Why split it.** SQLite was the original bottleneck (single writer →
+deadlocks under concurrent tick loops). With Postgres in place, each
+strategy gets its own httpx pool, its own ticker, its own bankroll
+slice, and can be independently scaled / restarted / temporarily
+disabled without dragging down the others. The orders-watcher runs as
+a single instance so we never double-fill (paper) or double-settle.
+
+### Container responsibilities
+
+- **`strategy-*`** — runs `polymarket-bot strategy <name>`. Each tick:
+  1. Reads `enabled_strategies` from `meta` — sleeps if its own name is
+     missing (the dashboard toggle from Phase A).
+  2. Fetches its bankroll slice via `config.strategy_share(name)` (env
+     `BANKROLL_SHARE_<UPPER_NAME>`, defaults to 1/N).
+  3. Discovers open events for the configured cities, populates quotes,
+     attaches model probabilities, calls `strategy.evaluate(BetState)`.
+  4. Routes resulting actions through `Router → Broker`.
+  5. **Does NOT** call `reconcile_fills` or settle — those live in the
+     orders-watcher. This is the key invariant of the split.
+
+- **`orders-watcher`** — runs `polymarket-bot orders-watcher`. Each tick:
+  1. `SELECT * FROM orders WHERE status='open'` — across all
+     strategies.
+  2. Groups by event-slug-prefix; synthesises a `WeatherEvent` shell
+     (token-ids only, no probabilities) from the `markets` table; calls
+     `broker.reconcile_fills(stub)`.
+  3. Calls `_settle_resolved_events(config)` which, per Phase C.5,
+     dispatches to `polymarket.settle.settle_resolved_event` — the
+     payout is decomposed into one Settlement row per `(market_id,
+     strategy)` based on `fills.strategy` aggregation.
+
+- **`dashboard`** — runs `polymarket-bot dashboard`. Wraps the existing
+  `start_dashboard()` HTTP thread, then heartbeats `last_running_ts:dashboard`
+  every 30s so docker-compose can prove liveness.
+
+### Per-strategy bankroll
+
+Each strategy commits inside its own slice. The runner reads it lazily:
+
+```
+share = config.strategy_share(strategy.name)   # 0.0 .. 1.0
+strat_bankroll = global_equity * share
+```
+
+Override per strategy with env vars: `BANKROLL_SHARE_WEATHER_FORECAST=0.7`,
+`BANKROLL_SHARE_BUCKET_ARBITRAGE=0.3`. Default is 1/N for the N
+registered strategies. Out-of-range values clamp to `[0, 1]`. Inside
+`_strategy_tick`, exposure is also strategy-scoped via
+`inventory_snapshot_for(strategy.name, market_ids)` — strategies can
+hold YES on the same market without competing for each other's exposure
+budget.
+
+### Settlement decomposition
+
+`settlements` PK is now **composite**: `(market_id, strategy)`. When a
+market resolves, `settle_resolved_event` aggregates `fills` by
+strategy and writes one row per strategy that took a fill on it. This
+means per-strategy P&L on the dashboard is accurate even when both
+strategies bought the same bucket. `insert_settlement` upserts on
+`(market_id, strategy)` — re-running settlement is idempotent.
+
+### Shared forecast cache
+
+N strategy containers calling Open-Meteo independently would multiply
+fetches by N and trip rate limits. Mitigation:
+
+- L1 in-process dict, TTL 3h (per `weather_feed.CACHE_TTL_SECONDS`).
+- L2 Postgres `forecast_cache (city_key, target_date, fetched_at,
+  members JSONB)`. `get_ensemble` checks L1 → L2 → Open-Meteo, writing
+  back to L2 (and L1) on every external fetch. All strategy services
+  share the L2 table, so the second container's first call after the
+  first one populates the cache is free.
+
+CLOB books stay per-service (cheap, no rate-limit risk).
+
+### What changed in the legacy `polymarket-bot run` path
+
+Nothing functionally — the old in-process loop still works for local
+dev (`pip install -e .[dev]; polymarket-bot run`) and is still used by
+several integration tests. The `bot` service has been removed from
+`docker-compose.yml`; if you want it back, point a one-shot container
+at the same Postgres URL and run `polymarket-bot run`.
 
 ## Configuration
 
@@ -404,27 +544,42 @@ Dashboard: http://localhost:8080 (or whatever `DASHBOARD_PORT` is set to).
 ## Deployment (Docker)
 
 ```bash
-docker compose up -d --build bot
-docker compose logs -f bot
+docker compose up -d --build
+docker compose logs -f orders-watcher
+docker compose logs -f strategy-weather
 ```
 
-Compose file [`docker-compose.yml`](docker-compose.yml) reads `.env`,
-publishes `${DASHBOARD_PORT:-8080}` (host) → same (container), mounts
-`bot_state` named volume at `/app/state`.
+Compose file [`docker-compose.yml`](docker-compose.yml) defines five
+services: `postgres:16-alpine` (with `pg_data` named volume),
+`strategy-weather`, `strategy-bucket-arb`, `orders-watcher`, and
+`dashboard`. All four app services `depends_on: postgres { condition:
+service_healthy }`, share `.env`, and connect via `DATABASE_URL` to the
+in-network `postgres` host. Only `dashboard` publishes a host port
+(`${DASHBOARD_PORT:-8080}`).
 
-To change `WEATHER_CITIES` or any other config: edit `.env` and
-`docker compose up -d --build bot`. To pick up source changes, the rebuild
+To change `WEATHER_CITIES` or any other shared config: edit `.env` and
+`docker compose up -d --build`. To pick up source changes, the rebuild
 flag (`--build`) is required.
+
+To pause one strategy without restarting anything: hit the dashboard's
+Strategies page and toggle it off — the runner reads
+`enabled_strategies` from the DB on every tick and will stop emitting
+new BUYs (existing positions still profit-take and settle through the
+orders-watcher).
 
 ## Tests
 
 ```bash
-pytest -q   # 60 tests, runs in <1s
+pytest -q   # ~170 tests; ~10s on first run (Postgres testcontainer warm-up), <3s thereafter
 ```
 
-Fast and dependency-free; they don't hit the network. Tests cover
-quote parsing, weather feed bucketing, strategy evaluation, settlement fees,
-and live-broker error handling.
+Tests use a session-scoped `postgres:16-alpine` testcontainer with
+`TRUNCATE … RESTART IDENTITY CASCADE` between tests; they don't hit
+the network. Coverage spans quote parsing, weather feed bucketing,
+strategy evaluation, settlement fees, live-broker error handling,
+Phase C per-strategy helpers (`inventory_snapshot_for`,
+`total_open_exposure_for`, `forecast_cache_*`), the strategy-runner
+disabled-gate, and per-strategy `strategy_share` config logic.
 
 ## Caveats / gotchas
 
@@ -458,6 +613,41 @@ and live-broker error handling.
    verify before adding US cities or any city Polymarket happens to publish
    in °F.
 
+## First-live runbook
+
+The bot has a two-key safety on the live path: `--live` flag **and**
+`POLYMARKET_BOT_LIVE=1` env. The first time you flip the switch, follow
+this in order:
+
+1. **`polymarket-bot preflight`** — checks `PRIVATE_KEY` is set, chain id
+   is Polygon mainnet (137), gamma is reachable, the wallet has USDC and
+   has approved the CLOB exchange contract for spending. Exits non-zero
+   on any failure. Re-run after any wallet / key / allowance change.
+2. **Set the cap small first.** `MAX_ORDER_NOTIONAL_USD=5` for the first
+   session. The Router blocks any single BUY/SELL above this cap.
+3. **Drift watch.** `sync_wallet_balance` runs every 5 min and emits an
+   `equity_drift` warning when wallet cash diverges from our derived
+   realized cash by > $1. If you see one, stop the bot and audit the
+   `fills` / `settlements` tables manually before resuming.
+4. **HALT recovery.** A HALT-class CLOB error (`Unauthorized`, `address
+   banned`, etc.) sets a process-wide `_HALTED` flag and the next tick
+   exits with `bot_halted_due_to_clob_error`. Inspect the logs for the
+   triggering error, fix it (rotate key / re-approve contract / update
+   creds in `.env`), then `docker compose restart bot`.
+5. **Retry semantics.** Transient CLOB errors (rate-limit, matching-engine
+   restart, transport blips) are retried up to 3× with exponential backoff
+   inside `LiveBroker._place_with_retry`. SKIP-class errors (tick size,
+   min order, expiry) propagate immediately — fix the strategy, don't
+   retry the order. After `_RETRY_MAX` failed attempts the order is
+   abandoned with `place_gave_up`; the strategy will re-evaluate on the
+   next tick.
+6. **Fill-price accuracy.** `LiveBroker.reconcile_fills` calls
+   `client.get_trades_for_order(...)` and computes the weighted-avg
+   price across CLOB trades to attribute the new chunk's fill price.
+   Falls back to the order's limit price when trades are unavailable
+   (correct approximation for taker fills against a static book — the
+   bot's predominant order shape).
+
 ## Common changes & where they go
 
 | Goal | File(s) |
@@ -467,6 +657,8 @@ and live-broker error handling.
 | Add a new dashboard endpoint | `dashboard/api.py:dispatch_get` |
 | Add a new dashboard page | `dashboard/static/app.js` (`ROUTES` + new `pageX` fn + nav link in `index.html`) |
 | Add a column to a table | the relevant `*_COLS` constant in `app.js` |
-| Add a new strategy | `strategy/registry.py` + a class implementing `Strategy` |
+| Add a new strategy | `strategy/registry.py` + class implementing `BettingStrategy` + a new `strategy-<name>` service in `docker-compose.yml` running `polymarket-bot strategy <name>` |
 | Change ensemble model selection | `data/weather_feed.py:get_ensemble` (the `models=` query param) |
 | Add a new persistence table | `persistence/schema.py:SCHEMA_DDL` + accessors in `repo.py` |
+| Tune per-strategy bankroll split | `BANKROLL_SHARE_<UPPER_NAME>` env vars (read in `config.from_env`); defaults to 1/N |
+| Change orders-watcher cadence | `TICK_SECONDS` env var (shared with strategy services today; can be split later) |

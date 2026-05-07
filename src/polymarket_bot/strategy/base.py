@@ -121,7 +121,8 @@ class BetState:
 class BettingStrategy(ABC):
     """Stateless: state in, actions out. One call per event per tick."""
 
-    name: str = "abstract"
+    name: str = "abstract"           # registry key, never user-facing
+    display_name: str = "Abstract"   # human-readable label for the dashboard
 
     @abstractmethod
     def evaluate(self, state: BetState) -> list[OrderAction]: ...

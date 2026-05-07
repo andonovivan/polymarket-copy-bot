@@ -10,6 +10,7 @@ from polymarket_bot.persistence.repo import (
     all_open_orders,
     daily_pnl_summary,
     equity_curve,
+    get_enabled_strategies,
     get_market,
     inventory_snapshot,
     latest_equity,
@@ -17,10 +18,11 @@ from polymarket_bot.persistence.repo import (
     list_settlements,
     markets_bulk,
     markets_with_unsettled_fills,
+    set_enabled_strategies,
     settlement_stats,
     strategy_pnl_summary,
 )
-from polymarket_bot.strategy.registry import list_strategies
+from polymarket_bot.strategy.registry import get_display_name, list_strategies
 
 VERSION = "0.3.0"
 
@@ -141,14 +143,38 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
         # new charts need.
         position = _build_position_payload()
         day_start = int(time.time()) - (int(time.time()) % 86400)
-        stats = settlement_stats(from_ts=day_start)
-        stats["latest_equity"] = latest_equity()
         days = int(qs.get("days", ["30"])[0])
+
+        # Optional ?strategies=A,B filter. Default: all enabled strategies.
+        # The filter is applied to settlement-derived aggregates only;
+        # inventories / open orders / equity_curve are shared resources we
+        # don't slice here.
+        all_names = list_strategies()
+        enabled = get_enabled_strategies(default_all=all_names)
+        filter_param = qs.get("strategies", [""])[0].strip()
+        filter_set = (
+            {n.strip() for n in filter_param.split(",") if n.strip()}
+            if filter_param else enabled
+        )
+        # Treat "all enabled" the same as "no filter" — empty filter list
+        # means the helpers skip the AND clause entirely (faster).
+        filter_arg = sorted(filter_set) if filter_set != set(all_names) else None
+
+        stats = settlement_stats(from_ts=day_start, strategies=filter_arg)
+        stats["latest_equity"] = latest_equity()
+
+        all_strategy_pnl = strategy_pnl_summary(days=days)
+        strategy_pnl_filtered = [
+            {**row, "display_name": get_display_name(row["strategy"])}
+            for row in all_strategy_pnl
+            if not filter_set or row["strategy"] in filter_set
+        ]
         return 200, {
             "now": int(time.time()),
             "version": VERSION,
             "mode": config.mode if config else "paper",
             "strategy": config.strategy if config else None,
+            "filtered_strategies": sorted(filter_set),
             "stats_today": stats,
             "totals": position["totals"],
             "inventories": position["inventories"],
@@ -156,8 +182,8 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
             "equity_curve": [
                 {"ts": ts, "equity": eq} for ts, eq in equity_curve()
             ],
-            "daily_pnl": daily_pnl_summary(days=days),
-            "strategy_pnl": strategy_pnl_summary(days=days),
+            "daily_pnl": daily_pnl_summary(days=days, strategies=filter_arg),
+            "strategy_pnl": strategy_pnl_filtered,
         }
 
     if path == "/api/equity-curve":
@@ -202,10 +228,16 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
         return 200, {"settlements": out, "offset": offset, "has_more": has_more}
 
     if path == "/api/strategies":
+        all_names = list_strategies()
+        enabled = get_enabled_strategies(default_all=all_names)
         return 200, {
             "strategies": [
-                {"name": n, "enabled": (config.strategy == n if config else False)}
-                for n in list_strategies()
+                {
+                    "name": n,
+                    "display_name": get_display_name(n),
+                    "enabled": n in enabled,
+                }
+                for n in all_names
             ],
         }
 
@@ -225,4 +257,19 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
 
 
 def dispatch_post(path: str, body: dict, config: BotConfig | None) -> tuple[int, Any]:
+    if path == "/api/strategies/enabled":
+        # Body: {"names": ["weather_forecast", "bucket_arbitrage"]}.
+        # Persists the enabled set; the Router consults it on every
+        # `execute()` so the change takes effect on the next tick.
+        all_names = set(list_strategies())
+        raw = body.get("names")
+        if not isinstance(raw, list):
+            return 400, {"error": "names must be a list"}
+        names = {str(n) for n in raw}
+        unknown = names - all_names
+        if unknown:
+            return 400, {"error": f"unknown strategies: {sorted(unknown)}"}
+        set_enabled_strategies(names)
+        return 200, {"enabled": sorted(names)}
+
     return 404, {"error": "not found"}

@@ -51,6 +51,7 @@ def _kelly_fraction(p: float, price: float) -> float:
 
 class WeatherForecastStrategy(BettingStrategy):
     name = "weather_forecast"
+    display_name = "Weather"
 
     def evaluate(self, state: BetState) -> list[OrderAction]:
         if state.seconds_to_resolution <= state.lockout_seconds:

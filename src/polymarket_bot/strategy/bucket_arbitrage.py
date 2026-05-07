@@ -49,6 +49,7 @@ MIN_ORDER_NOTIONAL = 1.0
 
 class BucketArbitrageStrategy(BettingStrategy):
     name = "bucket_arbitrage"
+    display_name = "Bucket Arbitrage"
 
     def evaluate(self, state: BetState) -> list[OrderAction]:
         if state.seconds_to_resolution <= state.lockout_seconds:

@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from polymarket_bot.persistence.schema import init_db, get_conn
+from polymarket_bot.persistence.schema import get_pool
 from polymarket_bot.strategy.calibration import (
     MIN_BIAS_EVENTS,
     MIN_CALIBRATION_OBS,
@@ -20,17 +20,21 @@ from polymarket_bot.strategy.calibration import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _reset_calibration_caches():
+    """The conftest.py autouse fixture truncates DB tables; we additionally
+    reset the in-process bias/calibrator caches that calibration.py keeps."""
+    reset_caches()
+    yield
+    reset_caches()
+
+
+# Backwards-compat shim: tests reference `tmp_db` in their signatures, but
+# the autouse conftest fixture already handles DB lifecycle. This fixture
+# is now a no-op so we don't have to rename every test.
 @pytest.fixture
-def tmp_db(tmp_path, monkeypatch):
-    db_path = tmp_path / "bot_state.db"
-    monkeypatch.setenv("BOT_DB_PATH", str(db_path))
-    import polymarket_bot.persistence.schema as schema_mod
-    schema_mod._conn = None
-    init_db(db_path)
-    reset_caches()
-    yield db_path
-    schema_mod._conn = None
-    reset_caches()
+def tmp_db():
+    yield
 
 
 # ---------------------------------------------------------------------------
@@ -66,16 +70,15 @@ def test_bucket_midpoint_unparseable():
 def _seed_winning_obs(city_key: str, model_day_max: float, label: str,
                       observed_at: int | None = None) -> None:
     """Insert one settled (winning-bucket) row to drive `compute_city_bias`."""
-    conn = get_conn()
-    conn.execute(
-        "INSERT INTO weather_research_obs "
-        "(city_key, target_date, slug, bucket_label, model_p, "
-        " model_day_max_mean, observed_at, outcome) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
-        (city_key, "2026-04-01", f"slug-{label}-{observed_at or 0}",
-         label, 0.5, model_day_max, observed_at or int(time.time())),
-    )
-    conn.commit()
+    with get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO weather_research_obs "
+            "(city_key, target_date, slug, bucket_label, model_p, "
+            " model_day_max_mean, observed_at, outcome) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, 1)",
+            (city_key, "2026-04-01", f"slug-{label}-{observed_at or 0}",
+             label, 0.5, model_day_max, observed_at or int(time.time())),
+        )
 
 
 def test_bias_curve_none_when_no_data(tmp_db):
@@ -188,16 +191,15 @@ def test_apply_bias_correction_temperature_dependent():
 
 def _seed_obs(city_key: str, model_p: float, won: int,
               observed_at: int | None = None) -> None:
-    conn = get_conn()
-    conn.execute(
-        "INSERT INTO weather_research_obs "
-        "(city_key, target_date, slug, bucket_label, model_p, "
-        " observed_at, outcome) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (city_key, "2026-04-01", f"slug-{model_p}-{observed_at or 0}",
-         "16°C", model_p, observed_at or int(time.time()), won),
-    )
-    conn.commit()
+    with get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO weather_research_obs "
+            "(city_key, target_date, slug, bucket_label, model_p, "
+            " observed_at, outcome) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (city_key, "2026-04-01", f"slug-{model_p}-{observed_at or 0}",
+             "16°C", model_p, observed_at or int(time.time()), won),
+        )
 
 
 def test_calibrator_none_below_min_obs(tmp_db):

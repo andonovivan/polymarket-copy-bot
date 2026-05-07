@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-import polymarket_bot.persistence.schema as schema
 from polymarket_bot.persistence.repo import (
     Fill,
     Market,
@@ -20,8 +19,9 @@ from polymarket_bot.strategy.base import Bucket, WeatherEvent
 
 
 def _fresh_db(tmp_path: Path) -> None:
-    schema._conn = None
-    schema.init_db(tmp_path / "test.db")
+    """Compatibility shim — DB lifecycle is owned by the conftest.py
+    autouse fixture. This is kept as a no-op so existing test signatures
+    (which take a `tmp_path` parameter) still work without rewrites."""
 
 
 def _seed_market_with_yes_buy(market_id: str, slug: str, yes_token: str,

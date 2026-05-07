@@ -1,22 +1,84 @@
 services:
-  bot:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: polymarket_bot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_local_dev}
+      POSTGRES_DB: polymarket_bot
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polymarket_bot -d polymarket_bot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Phase C — Microservices split
+  #
+  # Each strategy lives in its own container, ticking independently against
+  # its own bankroll slice (BANKROLL_SHARE_<UPPER_NAME>). The orders-watcher
+  # is a single instance that owns CLOB fill polling + per-strategy
+  # settlement decomposition. The dashboard container is HTTP-only, no tick
+  # loop. They all share the Postgres DB.
+  #
+  # The legacy single-process `bot` service has been decomposed; to bring
+  # it back for local dev, run `polymarket-bot run` against the same DB.
+  # ────────────────────────────────────────────────────────────────────────
+
+  strategy-weather:
     build: .
     env_file: .env
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["polymarket-bot", "strategy", "weather_forecast"]
+    environment:
+      - DATABASE_URL=postgresql://polymarket_bot:${POSTGRES_PASSWORD:-changeme_local_dev}@postgres:5432/polymarket_bot
+      # Path B research capture: feeds calibration.py with per-city
+      # (model_p, observed outcome). Strategy-weather is the only writer
+      # (the arb container produces the same data) — keep it on here.
+      - RESEARCH_ENABLED=1
+
+  strategy-bucket-arb:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["polymarket-bot", "strategy", "bucket_arbitrage"]
+    environment:
+      - DATABASE_URL=postgresql://polymarket_bot:${POSTGRES_PASSWORD:-changeme_local_dev}@postgres:5432/polymarket_bot
+      # Arb is model-independent — disable Path B capture here so we don't
+      # double-write rows from two containers.
+      - RESEARCH_ENABLED=0
+
+  orders-watcher:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["polymarket-bot", "orders-watcher"]
+    environment:
+      - DATABASE_URL=postgresql://polymarket_bot:${POSTGRES_PASSWORD:-changeme_local_dev}@postgres:5432/polymarket_bot
+
+  dashboard:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["polymarket-bot", "dashboard"]
     ports:
       - "${DASHBOARD_PORT:-8080}:${DASHBOARD_PORT:-8080}"
     environment:
-      - BOT_DB_PATH=/app/state/bot_state.db
-      # Capture (model_p, model_day_max_mean, market_p, outcome) per bucket
-      # for every city — feeds strategy/calibration.py (per-city bias + isotonic
-      # probability calibration). Read-only: never places orders.
-      - RESEARCH_ENABLED=1
-      # Run the weather-forecast strategy alongside the bucket-arbitrage
-      # scanner. The arb scanner is model-independent: it buys all 11 buckets
-      # of an event when the YES asks sum to <$0.93, locking in risk-free PnL.
-      - STRATEGY=weather_forecast,bucket_arbitrage
-    volumes:
-      - bot_state:/app/state
+      - DATABASE_URL=postgresql://polymarket_bot:${POSTGRES_PASSWORD:-changeme_local_dev}@postgres:5432/polymarket_bot
 
 volumes:
-  bot_state:
+  pg_data:

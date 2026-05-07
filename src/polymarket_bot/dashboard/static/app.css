@@ -260,6 +260,50 @@ td.empty, td.loading {
 .bar-row-fill.neg { background: rgba(255, 107, 107, 0.55); }
 .bar-row-value { color: var(--text); text-align: right; }
 
+/* Strategy filter chip group at the top of the dashboard (Phase A.4). */
+.strategy-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 12px;
+}
+.strategy-filter-label { color: var(--text-dim); }
+.chip-group { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  background: var(--surface-2);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.chip:hover { color: var(--text); }
+.chip.active {
+  background: rgba(110, 168, 255, 0.18);
+  color: var(--text);
+  border-color: rgba(110, 168, 255, 0.5);
+}
+
+/* Subdued registry key under the human-readable strategy name. */
+.strategy-name-key {
+  color: var(--text-faint);
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Native-looking checkbox in the Strategies table. */
+.strategy-toggle {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
 /* uPlot dark adjustments */
 .uplot { color: var(--text-dim); }
 .u-axis text { fill: var(--text-faint) !important; }

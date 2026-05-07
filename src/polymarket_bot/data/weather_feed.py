@@ -135,11 +135,41 @@ def get_ensemble(city: City, target_date: str) -> EnsembleForecast | None:
     """Return cached or freshly-fetched ensemble forecast for `target_date`.
 
     `target_date` is a YYYY-MM-DD string in the city's local timezone.
+
+    Two-level cache (Phase C.5):
+      1. **In-process** — `_FORECAST_CACHE` for sub-second hits within one
+         tick loop. Same code path as before.
+      2. **Postgres `forecast_cache`** — shared across services. When the
+         strategy services run as separate containers (Phase C), without
+         this each one would independently hit Open-Meteo. With it, the
+         first service to fetch populates the row; the others read it.
     """
     key = (city.key, target_date)
+
+    # L1 — in-process.
     cached = _FORECAST_CACHE.get(key)
     if cached and (time.time() - cached.fetched_at) < CACHE_TTL_SECONDS:
         return cached
+
+    # L2 — Postgres. Wrapped in try/except so a DB hiccup doesn't kill the
+    # tick — we'd just fall through to the Open-Meteo fetch.
+    try:
+        from polymarket_bot.persistence.repo import (
+            forecast_cache_get, forecast_cache_put,
+        )
+        shared = forecast_cache_get(city.key, target_date, CACHE_TTL_SECONDS)
+    except Exception as exc:
+        logger.warning("forecast_cache_read_failed",
+                       city=city.key, date=target_date,
+                       error=str(exc)[:160])
+        shared = None
+    if shared is not None:
+        forecast = EnsembleForecast(
+            city_key=city.key, target_date=target_date,
+            fetched_at=int(time.time()), members=shared,
+        )
+        _FORECAST_CACHE[key] = forecast
+        return forecast
 
     # Look back enough days that target_date is in the response window.
     today = int(time.time()) // 86400
@@ -180,6 +210,14 @@ def get_ensemble(city: City, target_date: str) -> EnsembleForecast | None:
     forecast = EnsembleForecast(city_key=city.key, target_date=target_date,
                                 fetched_at=int(time.time()), members=members)
     _FORECAST_CACHE[key] = forecast
+    # Best-effort write to the shared cache so other services don't refetch.
+    try:
+        from polymarket_bot.persistence.repo import forecast_cache_put
+        forecast_cache_put(city.key, target_date, members)
+    except Exception as exc:
+        logger.warning("forecast_cache_write_failed",
+                       city=city.key, date=target_date,
+                       error=str(exc)[:160])
     logger.info("ensemble_fetched", city=city.key, date=target_date,
                 members=len(members),
                 range=f"{min(members)}-{max(members)}",

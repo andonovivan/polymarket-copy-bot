@@ -6,7 +6,6 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import polymarket_bot.execution.live_broker as lb
-import polymarket_bot.persistence.schema as schema
 from polymarket_bot.execution.live_broker import DECIMALS, LiveBroker, _fm6
 from polymarket_bot.persistence.repo import (
     Market,
@@ -18,8 +17,8 @@ from polymarket_bot.strategy.base import Bucket, PlaceLimit, WeatherEvent
 
 
 def _fresh_db(tmp_path: Path) -> None:
-    schema._conn = None
-    schema.init_db(tmp_path / "test.db")
+    """Compat shim — DB lifecycle is in tests/conftest.py. Still resets the
+    halt flag so each LiveBroker test starts from a clean state."""
     lb.reset_halt_for_test()
 
 

@@ -40,7 +40,7 @@ from typing import Callable, Optional
 import structlog
 from sklearn.isotonic import IsotonicRegression
 
-from polymarket_bot.persistence.schema import get_conn, lock
+from polymarket_bot.persistence.schema import get_pool
 
 logger = structlog.get_logger()
 
@@ -98,14 +98,13 @@ def _query_bias_samples(city_key: str,
     midpoint of the winning bucket (bucket-resolution noise of ±0.5°C is
     averaged out across multiple events).
     """
-    conn = get_conn()
     cutoff = int(time.time()) - lookback_days * 86400
-    with lock():
+    with get_pool().connection() as conn:
         rows = conn.execute(
             "SELECT slug, observed_at, model_day_max_mean, bucket_label "
             "FROM weather_research_obs "
-            "WHERE city_key=? AND outcome=1 AND model_day_max_mean IS NOT NULL "
-            "  AND observed_at >= ? ",
+            "WHERE city_key=%s AND outcome=1 AND model_day_max_mean IS NOT NULL "
+            "  AND observed_at >= %s",
             (city_key, cutoff),
         ).fetchall()
     samples: list[tuple[float, float]] = []
@@ -204,12 +203,11 @@ def apply_bias_correction(members: list[int],
 def _query_calibration_samples(city_key: str,
                                lookback_days: int) -> tuple[list[float], list[int]]:
     """Return (model_p, won) pairs for settled bucket observations."""
-    conn = get_conn()
     cutoff = int(time.time()) - lookback_days * 86400
-    with lock():
+    with get_pool().connection() as conn:
         rows = conn.execute(
             "SELECT model_p, outcome FROM weather_research_obs "
-            "WHERE city_key=? AND outcome IS NOT NULL AND observed_at >= ? ",
+            "WHERE city_key=%s AND outcome IS NOT NULL AND observed_at >= %s",
             (city_key, cutoff),
         ).fetchall()
     xs: list[float] = []

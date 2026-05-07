@@ -2,33 +2,16 @@
 
 from __future__ import annotations
 
-import os
 import time
-from pathlib import Path
 
-import pytest
-
-from polymarket_bot.persistence.schema import init_db, get_conn
+from polymarket_bot.persistence.schema import get_pool
 from polymarket_bot.research.weather_capture import (
     _record_obs,
     _recent_obs_exists,
 )
 
 
-@pytest.fixture
-def tmp_db(tmp_path, monkeypatch):
-    """Fresh sqlite database for each test, isolated via BOT_DB_PATH."""
-    db_path = tmp_path / "bot_state.db"
-    monkeypatch.setenv("BOT_DB_PATH", str(db_path))
-    # The schema module caches a singleton connection; reset between tests.
-    import polymarket_bot.persistence.schema as schema_mod
-    schema_mod._conn = None
-    init_db(db_path)
-    yield db_path
-    schema_mod._conn = None
-
-
-def test_record_obs_then_recent_exists_within_window(tmp_db):
+def test_record_obs_then_recent_exists_within_window():
     _record_obs(
         city_key="taipei",
         target_date="2026-05-10",
@@ -46,26 +29,25 @@ def test_record_obs_then_recent_exists_within_window(tmp_db):
     ) is True
 
 
-def test_recent_exists_false_when_no_match(tmp_db):
+def test_recent_exists_false_when_no_match():
     assert _recent_obs_exists("taipei", "any-slug", "22°C", within_seconds=600) is False
 
 
-def test_recent_exists_respects_within_seconds(tmp_db):
+def test_recent_exists_respects_within_seconds():
     """An obs older than within_seconds should not satisfy the recency check."""
-    conn = get_conn()
     old_ts = int(time.time()) - 3600   # 1 hour ago
-    conn.execute(
-        "INSERT INTO weather_research_obs "
-        "(city_key, target_date, slug, bucket_label, model_p, observed_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ("moscow", "2026-05-10", "slug-m", "20°C", 0.5, old_ts),
-    )
-    conn.commit()
+    with get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO weather_research_obs "
+            "(city_key, target_date, slug, bucket_label, model_p, observed_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            ("moscow", "2026-05-10", "slug-m", "20°C", 0.5, old_ts),
+        )
     assert _recent_obs_exists("moscow", "slug-m", "20°C", within_seconds=60) is False
     assert _recent_obs_exists("moscow", "slug-m", "20°C", within_seconds=7200) is True
 
 
-def test_record_obs_handles_null_market_quotes(tmp_db):
+def test_record_obs_handles_null_market_quotes():
     """Empty order books → mid/bid/ask all None; the row should still write."""
     _record_obs(
         city_key="helsinki",
@@ -76,9 +58,9 @@ def test_record_obs_handles_null_market_quotes(tmp_db):
         model_day_max_mean=None,
         mid=None, bid=None, ask=None,
     )
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT model_p, market_yes_mid, market_yes_bid, market_yes_ask "
-        "FROM weather_research_obs WHERE city_key='helsinki'"
-    ).fetchone()
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT model_p, market_yes_mid, market_yes_bid, market_yes_ask "
+            "FROM weather_research_obs WHERE city_key='helsinki'"
+        ).fetchone()
     assert row == (0.3, None, None, None)
