@@ -14,6 +14,7 @@ from polymarket_bot.persistence.repo import (
     get_market,
     get_meta,
     inventory_snapshot,
+    inventory_snapshot_for_strategies,
     latest_equity,
     list_fills,
     list_settlements,
@@ -51,19 +52,28 @@ def _settlement_dict(s) -> dict[str, Any]:
     )}
 
 
-def _build_position_payload() -> dict[str, Any]:
+def _build_position_payload(strategies: list[str] | None = None) -> dict[str, Any]:
     """Build the open-orders + inventories + totals block.
 
     Replaces the old N+1 pattern (one `inventory_for_market` and one
     `get_market` call per row) with two bulk queries: `inventory_snapshot`
     and `markets_bulk`.
+
+    `strategies=None` (default) keeps the cross-strategy view used by the
+    bare /api/position endpoint and the dashboard when no chip filter is
+    active. When the chip filter narrows the view, the dashboard caller
+    passes the selected strategies and inventories / open orders / totals
+    are sliced accordingly — so the cards visibly respond to the filter.
     """
-    orders = all_open_orders()
+    orders = all_open_orders(strategies=strategies)
     order_market_ids = {o.market_id for o in orders}
-    unsettled = set(markets_with_unsettled_fills())
+    unsettled = set(markets_with_unsettled_fills(strategies=strategies))
     inv_market_ids = sorted(unsettled | order_market_ids)
 
-    inv_map = inventory_snapshot(inv_market_ids)
+    if strategies:
+        inv_map = inventory_snapshot_for_strategies(strategies, inv_market_ids)
+    else:
+        inv_map = inventory_snapshot(inv_market_ids)
     market_map = markets_bulk(sorted(set(inv_market_ids) | order_market_ids))
 
     inventories: list[dict[str, Any]] = []
@@ -189,14 +199,14 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
         # subset + /api/stats/today + /api/equity-curve + /api/position +
         # /api/fills?limit=15) and adds the daily/strategy aggregates that the
         # new charts need.
-        position = _build_position_payload()
         day_start = int(time.time()) - (int(time.time()) % 86400)
         days = int(qs.get("days", ["30"])[0])
 
         # Optional ?strategies=A,B filter. Default: all enabled strategies.
-        # The filter is applied to settlement-derived aggregates only;
-        # inventories / open orders / equity_curve are shared resources we
-        # don't slice here.
+        # When the user narrows the chip filter, slice the WHOLE payload —
+        # totals, inventories, open orders, settlement aggregates — so the
+        # cards visibly respond. Equity curve stays bot-wide (it's the
+        # bot's MTM, not strategy-attributable in a clean way).
         all_names = list_strategies()
         enabled = get_enabled_strategies(default_all=all_names)
         filter_param = qs.get("strategies", [""])[0].strip()
@@ -207,6 +217,8 @@ def dispatch_get(path: str, qs: dict[str, list[str]], config: BotConfig | None) 
         # Treat "all enabled" the same as "no filter" — empty filter list
         # means the helpers skip the AND clause entirely (faster).
         filter_arg = sorted(filter_set) if filter_set != set(all_names) else None
+
+        position = _build_position_payload(strategies=filter_arg)
 
         stats = settlement_stats(from_ts=day_start, strategies=filter_arg)
         stats["latest_equity"] = latest_equity()

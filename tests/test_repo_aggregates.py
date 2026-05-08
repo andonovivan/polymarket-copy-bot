@@ -37,7 +37,9 @@ def _seed_market(mid: str, title: str = "Paris · May 5 · 14°C") -> None:
 
 def _seed_fill(mid: str, *, token: str, side: str, size: float, price: float,
                strategy: str = "weather_forecast") -> None:
-    order_id = f"o-{mid}-{token}-{side}"
+    # Include strategy in the order_id so a single market can carry fills
+    # from multiple strategies in one test without colliding on orders_pkey.
+    order_id = f"o-{mid}-{token}-{side}-{strategy}"
     insert_order(Order(
         order_id=order_id, client_order_id=order_id,
         market_id=mid, token_side=token, side=side,
@@ -228,3 +230,81 @@ def test_strategy_pnl_orders_descending_by_pnl():
     _seed_settlement("m2", pnl=10.0, settled_at=now - 200, strategy="winner")
     rows = strategy_pnl_summary()
     assert [r["strategy"] for r in rows] == ["winner", "loser"]
+
+
+# ---------------------------------------------------------------------------
+# Per-strategy chip filter — backs the dashboard's "Show:" chips so the
+# inventory / open-orders / totals cards visibly respond to selection.
+# ---------------------------------------------------------------------------
+
+def test_all_open_orders_filters_by_strategies():
+    from polymarket_bot.persistence.repo import all_open_orders
+    _seed_market("m1"); _seed_market("m2")
+    insert_order(Order(
+        order_id="oA", client_order_id="oA", market_id="m1",
+        token_side="YES", side="BUY", price=0.3, size=10, filled=0,
+        status="open", placed_at=int(time.time()), ended_at=None,
+        strategy="weather_forecast",
+    ))
+    insert_order(Order(
+        order_id="oB", client_order_id="oB", market_id="m2",
+        token_side="YES", side="BUY", price=0.4, size=5, filled=0,
+        status="open", placed_at=int(time.time()), ended_at=None,
+        strategy="bucket_arbitrage",
+    ))
+    all_orders = all_open_orders()
+    assert {o.order_id for o in all_orders} == {"oA", "oB"}
+
+    weather_only = all_open_orders(strategies=["weather_forecast"])
+    assert [o.order_id for o in weather_only] == ["oA"]
+
+    arb_only = all_open_orders(strategies=["bucket_arbitrage"])
+    assert [o.order_id for o in arb_only] == ["oB"]
+
+    union = all_open_orders(strategies=["weather_forecast", "bucket_arbitrage"])
+    assert {o.order_id for o in union} == {"oA", "oB"}
+
+
+def test_markets_with_unsettled_fills_filters_by_strategies():
+    from polymarket_bot.persistence.repo import markets_with_unsettled_fills
+    _seed_market("m1"); _seed_market("m2"); _seed_market("m3")
+    _seed_fill("m1", token="YES", side="BUY", size=10, price=0.3,
+               strategy="weather_forecast")
+    _seed_fill("m2", token="YES", side="BUY", size=5, price=0.4,
+               strategy="bucket_arbitrage")
+    # m3 has fills from BOTH strategies — should appear in either filter.
+    _seed_fill("m3", token="YES", side="BUY", size=2, price=0.5,
+               strategy="weather_forecast")
+    _seed_fill("m3", token="NO", side="BUY", size=1, price=0.6,
+               strategy="bucket_arbitrage")
+
+    assert set(markets_with_unsettled_fills()) == {"m1", "m2", "m3"}
+    assert set(markets_with_unsettled_fills(strategies=["weather_forecast"])) == {"m1", "m3"}
+    assert set(markets_with_unsettled_fills(strategies=["bucket_arbitrage"])) == {"m2", "m3"}
+
+
+def test_inventory_snapshot_for_strategies_sums_across_selected():
+    from polymarket_bot.persistence.repo import inventory_snapshot_for_strategies
+    _seed_market("m1")
+    # weather buys 10 @ 0.3, bucket-arb buys 4 @ 0.5 — both YES on m1.
+    _seed_fill("m1", token="YES", side="BUY", size=10, price=0.3,
+               strategy="weather_forecast")
+    _seed_fill("m1", token="YES", side="BUY", size=4, price=0.5,
+               strategy="bucket_arbitrage")
+
+    weather_only = inventory_snapshot_for_strategies(["weather_forecast"], ["m1"])
+    assert weather_only["m1"][0] == 10  # yes_shares
+    assert weather_only["m1"][2] == pytest.approx(0.3)  # avg_yes
+
+    union = inventory_snapshot_for_strategies(
+        ["weather_forecast", "bucket_arbitrage"], ["m1"],
+    )
+    assert union["m1"][0] == 14
+    # Volume-weighted avg: (10*0.3 + 4*0.5) / 14 ≈ 0.357
+    assert union["m1"][2] == pytest.approx((10 * 0.3 + 4 * 0.5) / 14)
+
+
+def test_inventory_snapshot_for_strategies_empty_inputs():
+    from polymarket_bot.persistence.repo import inventory_snapshot_for_strategies
+    assert inventory_snapshot_for_strategies([], ["m1"]) == {}
+    assert inventory_snapshot_for_strategies(["weather_forecast"], []) == {}

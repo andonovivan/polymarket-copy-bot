@@ -228,11 +228,22 @@ def open_orders_by_market(market_id: str) -> list[Order]:
     return [Order(*r) for r in rows]
 
 
-def all_open_orders() -> list[Order]:
+def all_open_orders(strategies: list[str] | None = None) -> list[Order]:
+    """All open orders, optionally narrowed to a set of strategies.
+
+    Pass `strategies=None` (default) for the cross-strategy view used by
+    /api/dashboard's unfiltered render and the orders-watcher reconciliation
+    pass. Pass a non-empty list to filter — e.g. when the dashboard chip
+    filter narrows to a single strategy.
+    """
+    sql = f"SELECT {_ORDER_COLS} FROM orders WHERE status='open'"
+    params: tuple[Any, ...] = ()
+    if strategies:
+        sql += " AND strategy = ANY(%s)"
+        params = (list(strategies),)
+    sql += " ORDER BY placed_at DESC"
     with get_pool().connection() as conn:
-        rows = conn.execute(
-            f"SELECT {_ORDER_COLS} FROM orders WHERE status='open' ORDER BY placed_at DESC"
-        ).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     return [Order(*r) for r in rows]
 
 
@@ -311,14 +322,25 @@ def list_fills(limit: int = 100, offset: int = 0) -> list[Fill]:
 # ---------------------------------------------------------------------------
 
 
-def markets_with_unsettled_fills() -> list[str]:
-    """All market_ids that have at least one fill and no Settlement row yet."""
+def markets_with_unsettled_fills(strategies: list[str] | None = None) -> list[str]:
+    """Market_ids with at least one fill and no Settlement row yet.
+
+    `strategies=None` returns the cross-strategy union (default). Passing a
+    list narrows to fills tagged with those strategies — used by the
+    dashboard's per-strategy chip filter so an inventory list only shows
+    positions the selected strategies actually opened.
+    """
+    sql = (
+        "SELECT DISTINCT f.market_id FROM fills f "
+        "WHERE NOT EXISTS (SELECT 1 FROM settlements s WHERE s.market_id = f.market_id)"
+    )
+    params: tuple[Any, ...] = ()
+    if strategies:
+        sql += " AND f.strategy = ANY(%s)"
+        params = (list(strategies),)
+    sql += " ORDER BY f.market_id"
     with get_pool().connection() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT f.market_id FROM fills f "
-            "WHERE NOT EXISTS (SELECT 1 FROM settlements s WHERE s.market_id = f.market_id) "
-            "ORDER BY f.market_id"
-        ).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     return [r[0] for r in rows]
 
 
@@ -394,6 +416,31 @@ def inventory_snapshot_for(
             "FROM fills WHERE strategy=%s AND market_id = ANY(%s) "
             "GROUP BY market_id, token_side, side",
             (strategy, list(market_ids)),
+        ).fetchall()
+    grouped: dict[str, list] = {}
+    for r in rows:
+        grouped.setdefault(r[0], []).append(r)
+    return {mid: _aggregate_inventory_rows(rs) for mid, rs in grouped.items()}
+
+
+def inventory_snapshot_for_strategies(
+    strategies: list[str], market_ids: list[str],
+) -> dict[str, tuple[float, float, float, float]]:
+    """Inventory aggregated across the given strategies.
+
+    Used by the dashboard's chip filter so the position cards / inventory
+    table reflect only the user-selected strategies. Differs from
+    `inventory_snapshot_for` (single strategy) by accepting a list and
+    summing across them in one SQL pass.
+    """
+    if not market_ids or not strategies:
+        return {}
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT market_id, token_side, side, SUM(size), SUM(size*price) "
+            "FROM fills WHERE strategy = ANY(%s) AND market_id = ANY(%s) "
+            "GROUP BY market_id, token_side, side",
+            (list(strategies), list(market_ids)),
         ).fetchall()
     grouped: dict[str, list] = {}
     for r in rows:
