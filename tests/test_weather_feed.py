@@ -65,3 +65,48 @@ def test_bucket_member_counts_matches_probabilities_times_n():
 
 def test_bucket_member_counts_empty_returns_zeros():
     assert bucket_member_counts([], ["20°C"]) == {"20°C": 0}
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit backoff cap
+# ---------------------------------------------------------------------------
+
+def test_rate_limit_backoff_capped_at_one_hour(monkeypatch):
+    """Regression: hitting a 'Daily' 429 right at UTC midnight previously
+    set _RATE_LIMITED_UNTIL ~24h in the future (the bot saw the response
+    before the server-side quota counter had fully reset, so my code
+    extended backoff to *next* midnight). Cap prevents that lockout."""
+    import urllib.error
+    import io
+    from polymarket_bot.data import weather_feed as wf
+
+    # Stub out time.time to land on a UTC midnight boundary.
+    fixed_now = 1778371200.0   # 2026-05-09 00:00:00 UTC
+    monkeypatch.setattr(wf.time, "time", lambda: fixed_now)
+    # Don't actually persist to meta in this unit test.
+    monkeypatch.setattr(
+        "polymarket_bot.persistence.repo.set_meta",
+        lambda key, value: None,
+    )
+    # Reset the in-process flag.
+    wf._RATE_LIMITED_UNTIL = 0.0
+
+    # Build a fake HTTPError carrying the daily-limit body.
+    err = urllib.error.HTTPError(
+        url="x", code=429, msg="Too Many",
+        hdrs={"Retry-After": "60"},
+        fp=io.BytesIO(b'{"reason":"Daily API request limit exceeded.","error":true}'),
+    )
+
+    def raise_429(*args, **kwargs):
+        raise err
+
+    monkeypatch.setattr(wf.urllib.request, "urlopen", raise_429)
+
+    out = wf._fetch_json("https://example/x")
+    assert out is None
+    backoff = wf._RATE_LIMITED_UNTIL - fixed_now
+    # Without the cap, this would be ~86400 (next UTC midnight). With the
+    # cap, max 3600s.
+    assert backoff <= wf.MAX_RATE_LIMIT_BACKOFF_SECONDS
+    assert backoff > 0

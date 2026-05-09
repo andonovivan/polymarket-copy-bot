@@ -34,6 +34,13 @@ CACHE_TTL_SECONDS = 3 * 3600
 # When we get a 429, suppress further fetches for this long. Stops the bot
 # from hammering the API on every tick after the limit hits.
 RATE_LIMIT_BACKOFF_SECONDS = 120
+# Hard cap on any single 429 backoff. Daily-quota responses still trigger an
+# until-midnight backoff in principle, but capping at 1h means a 429 received
+# *at* the moment of UTC midnight (when Open-Meteo's quota is still resetting
+# server-side) doesn't lock us out for nearly the next 24h. Worst case we
+# probe once an hour during a real outage; the cost is ~24 calls/day vs the
+# benefit of recovering automatically within 1h of any quota reset.
+MAX_RATE_LIMIT_BACKOFF_SECONDS = 3600
 USER_AGENT = "polymarket-bot-weather/0.4"
 
 # Set to a unix timestamp when we get rate-limited; until then, all
@@ -125,6 +132,9 @@ def _fetch_json(url: str, *, max_retries: int = 3) -> dict | None:
                     now = time.time()
                     next_utc_midnight = (int(now // 86400) + 1) * 86400
                     retry_after = max(retry_after, next_utc_midnight - now)
+                # Cap any single backoff so a quota-reset race at the
+                # UTC-midnight boundary can't lock us out for nearly 24h.
+                retry_after = min(retry_after, MAX_RATE_LIMIT_BACKOFF_SECONDS)
                 _RATE_LIMITED_UNTIL = time.time() + retry_after
                 logger.warning("ensemble_rate_limited",
                                retry_after_seconds=retry_after,
