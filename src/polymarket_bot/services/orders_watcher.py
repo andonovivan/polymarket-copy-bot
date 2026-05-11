@@ -125,6 +125,27 @@ def _watcher_tick(config: BotConfig, broker: Broker) -> None:
     from polymarket_bot.main import _maybe_sample_equity
     _maybe_sample_equity(config)
 
+    # Phase C bug-fix #2: research capture (Path B) was also stranded in
+    # the legacy monolithic `main._tick` after the microservice split.
+    # Without it, `weather_research_obs` never populates, so the bias
+    # calibrator never fits — and we trade uncalibrated forever. Put it
+    # next to settlement so the singleton owns both data-collection
+    # passes; strategy services stay focused on signal generation.
+    if config.research_enabled:
+        try:
+            from polymarket_bot.research.weather_capture import (
+                capture_observations, update_outcomes,
+            )
+            capture_observations(
+                window_seconds=config.research_window_seconds,
+                dedupe_seconds=config.research_dedupe_seconds,
+                days_ahead=config.days_ahead,
+                include_candidates=config.research_capture_candidates,
+            )
+            update_outcomes()
+        except Exception as exc:
+            logger.warning("research_capture_error", error=str(exc)[:200])
+
 
 def _settle_resolved_events(config: BotConfig) -> None:
     """Find markets whose resolution_ts has passed AND have unsettled fills,
